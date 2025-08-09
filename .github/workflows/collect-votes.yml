@@ -1,0 +1,82 @@
+name: Collect Congress Votes (118–119)
+
+on:
+  schedule:
+    # Nightly at 09:30 UTC = 02:30 PT
+    - cron: "30 9 * * *"
+  workflow_dispatch:
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install system libs (per README)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget python3-dev libxml2-dev libxslt1-dev libz-dev python3-venv
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/setup.py') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install package + deps (pip install .)
+        run: |
+          python -m venv env
+          . env/bin/activate
+          pip install --upgrade pip
+          pip install .
+
+      # Backfill all sessions you care about
+      - name: Run votes scraper (full sessions)
+        env:
+          SESSIONS: "118.2023,118.2024,119.2025"
+        run: |
+          . env/bin/activate
+          ./run votes --sessions="${SESSIONS}" --log=info
+
+      # Optional: generate a manifest to make n8n ingestion easy
+      - name: Build manifest of vote JSON files
+        run: |
+          set -e
+          echo '{"files":[' > manifest.json
+          first=true
+          # Each vote is data/[congress]/votes/[session]/[chamber][number]/data.json
+          find data -type f -path "*/votes/*/*/data.json" | sort | while read -r f; do
+            if [ "$first" = true ]; then first=false; else echo "," >> manifest.json; fi
+            printf '"%s"' "$f" >> manifest.json
+          done
+          echo "]}" >> manifest.json
+          jq '. | length as $n | "Manifest contains: \($n) files"' manifest.json || true
+
+      # === OUTPUT OPTION A: commit JSON to repo (uncomment to use) ===
+      # - name: Commit data back to repository
+      #   if: always()
+      #   run: |
+      #     git config user.name "github-actions[bot]"
+      #     git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+      #     git add data manifest.json
+      #     git commit -m "chore(data): refresh vote JSON (auto)" || echo "No changes to commit"
+      #     git pull --rebase
+      #     git push
+
+      # === OUTPUT OPTION B: upload as an artifact (n8n can download) ===
+      - name: Upload artifact (votes JSON + manifest)
+        uses: actions/upload-artifact@v4
+        with:
+          name: votes-json
+          path: |
+            data/**/votes/**/data.json
+            manifest.json
