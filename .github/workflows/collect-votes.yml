@@ -4,7 +4,13 @@ on:
   schedule:
     # Nightly at 09:30 UTC = 02:30 PT
     - cron: "30 9 * * *"
+    # Weekly full refresh, Sundays 03:00 PT
+    - cron: "00 10 * * 0"
   workflow_dispatch:
+
+concurrency:
+  group: collect-votes
+  cancel-in-progress: true
 
 jobs:
   collect:
@@ -17,7 +23,7 @@ jobs:
       - name: Install system libs (per README)
         run: |
           sudo apt-get update
-          sudo apt-get install -y wget python3-dev libxml2-dev libxslt1-dev libz-dev python3-venv
+          sudo apt-get install -y wget python3-dev libxml2-dev libxslt1-dev libz-dev python3-venv jq
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -32,22 +38,25 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      - name: Install package + deps (pip install .)
+      - name: Install package + deps
         run: |
           python -m venv env
           . env/bin/activate
           pip install --upgrade pip
           pip install .
 
-      # Backfill all sessions you care about
-      - name: Run votes scraper (full sessions)
+      # Nightly runs use --fast; weekly full refresh skips it.
+      - name: Run votes scraper (sessions 118–119)
         env:
           SESSIONS: "118.2023,118.2024,119.2025"
         run: |
           . env/bin/activate
-          ./run votes --sessions="${SESSIONS}" --log=info
+          if [ "${{ github.event.schedule }}" = "30 9 * * *" ]; then
+            ./run votes --sessions="${SESSIONS}" --fast --log=info
+          else
+            ./run votes --sessions="${SESSIONS}" --log=info
+          fi
 
-      # Optional: generate a manifest to make n8n ingestion easy
       - name: Build manifest of vote JSON files
         run: |
           set -e
@@ -59,24 +68,27 @@ jobs:
             printf '"%s"' "$f" >> manifest.json
           done
           echo "]}" >> manifest.json
-          jq '. | length as $n | "Manifest contains: \($n) files"' manifest.json || true
+          jq '.files | length as $n | "Manifest contains: \($n) files"' manifest.json
 
-      # === OUTPUT OPTION A: commit JSON to repo (uncomment to use) ===
+      # Option A: commit to repo (leave commented if you prefer artifacts)
       # - name: Commit data back to repository
-      #   if: always()
       #   run: |
       #     git config user.name "github-actions[bot]"
       #     git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
       #     git add data manifest.json
-      #     git commit -m "chore(data): refresh vote JSON (auto)" || echo "No changes to commit"
+      #     git commit -m "chore(data): refresh vote JSON (auto)" || echo "No changes"
       #     git pull --rebase
       #     git push
 
-      # === OUTPUT OPTION B: upload as an artifact (n8n can download) ===
+      # Option B: upload artifacts for n8n to fetch
+      - name: Archive data
+        run: |
+          mkdir -p out
+          zip -r out/votes-json.zip data manifest.json
       - name: Upload artifact (votes JSON + manifest)
         uses: actions/upload-artifact@v4
         with:
           name: votes-json
-          path: |
-            data/**/votes/**/data.json
-            manifest.json
+          path: out/votes-json.zip
+          if-no-files-found: warn
+          retention-days: 7
