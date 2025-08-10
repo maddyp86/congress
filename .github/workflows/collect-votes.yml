@@ -38,24 +38,25 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      - name: Install package + deps
-        run: |
-          python -m venv env
-          . env/bin/activate
-          pip install --upgrade pip
-          pip install .
+- name: Install congress tool from GitHub
+  run: |
+    python -m venv env
+    . env/bin/activate
+    pip install --upgrade pip
+    pip install "git+https://github.com/unitedstates/congress.git"
 
       # Nightly runs use --fast; weekly full refresh skips it.
-      - name: Run votes scraper (sessions 118–119)
-        env:
-          SESSIONS: "118.2023,118.2024,119.2025"
-        run: |
-          . env/bin/activate
-          if [ "${{ github.event.schedule }}" = "30 9 * * *" ]; then
-            ./run votes --sessions="${SESSIONS}" --fast --log=info
-          else
-            ./run votes --sessions="${SESSIONS}" --log=info
-          fi
+
+- name: Run votes scraper (sessions 118–119)
+  env:
+    SESSIONS: "118.2023,118.2024,119.2025"
+  run: |
+    . env/bin/activate
+    if [ "${{ github.event.schedule }}" = "30 9 * * *" ]; then
+      usc-run votes --sessions="${SESSIONS}" --fast --log=info
+    else
+      usc-run votes --sessions="${SESSIONS}" --log=info
+    fi
 
       - name: Build manifest of vote JSON files
         run: |
