@@ -20,10 +20,10 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Install system libs (per README)
+      - name: Install system libs
         run: |
           sudo apt-get update
-          sudo apt-get install -y wget python3-dev libxml2-dev libxslt1-dev libz-dev python3-venv jq
+          sudo apt-get install -y wget python3-dev libxml2-dev libxslt1-dev libz-dev python3-venv jq zip
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -34,29 +34,43 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/setup.py') }}
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
           restore-keys: |
             ${{ runner.os }}-pip-
 
-- name: Install congress tool from GitHub
-  run: |
-    python -m venv env
-    . env/bin/activate
-    pip install --upgrade pip
-    pip install "git+https://github.com/unitedstates/congress.git"
+      - name: Install congress tool from GitHub (usc-run)
+        run: |
+          python -m venv env
+          . env/bin/activate
+          pip install --upgrade pip
+          pip install "git+https://github.com/unitedstates/congress.git"
 
       # Nightly runs use --fast; weekly full refresh skips it.
+      - name: Run votes scraper (sessions 118–119)
+        env:
+          SESSIONS: "118.2023,118.2024,119.2025"
+        run: |
+          . env/bin/activate
+          if [ "${{ github.event.schedule }}" = "30 9 * * *" ]; then
+            usc-run votes --sessions="${SESSIONS}" --fast --log=info
+          else
+            usc-run votes --sessions="${SESSIONS}" --log=info
+          fi
 
-- name: Run votes scraper (sessions 118–119)
-  env:
-    SESSIONS: "118.2023,118.2024,119.2025"
-  run: |
-    . env/bin/activate
-    if [ "${{ github.event.schedule }}" = "30 9 * * *" ]; then
-      usc-run votes --sessions="${SESSIONS}" --fast --log=info
-    else
-      usc-run votes --sessions="${SESSIONS}" --log=info
-    fi
+      - name: List scraped files
+        run: |
+          echo "Listing vote JSON files…"
+          find data -type f -path "*/votes/*/*/data.json" | sort | sed 's/^/  /' || true
+
+      - name: Validate files exist
+        run: |
+          set -e
+          COUNT=$(find data -type f -path "*/votes/*/*/data.json" | wc -l | tr -d ' ')
+          echo "Found $COUNT vote JSON files"
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::error::No vote JSON files were generated. Check sessions or network."
+            exit 1
+          fi
 
       - name: Build manifest of vote JSON files
         run: |
@@ -71,17 +85,7 @@ jobs:
           echo "]}" >> manifest.json
           jq '.files | length as $n | "Manifest contains: \($n) files"' manifest.json
 
-      # Option A: commit to repo (leave commented if you prefer artifacts)
-      # - name: Commit data back to repository
-      #   run: |
-      #     git config user.name "github-actions[bot]"
-      #     git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-      #     git add data manifest.json
-      #     git commit -m "chore(data): refresh vote JSON (auto)" || echo "No changes"
-      #     git pull --rebase
-      #     git push
-
-      # Option B: upload artifacts for n8n to fetch
+      # Upload artifacts for n8n to fetch
       - name: Archive data
         run: |
           mkdir -p out
@@ -91,5 +95,5 @@ jobs:
         with:
           name: votes-json
           path: out/votes-json.zip
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 7
