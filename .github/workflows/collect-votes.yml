@@ -1,4 +1,4 @@
-name: Collect Congress Votes (118–119)
+name: Collect Congress Data (118–119)
 
 on:
   schedule:
@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: collect-votes
+  group: collect-congress-data
   cancel-in-progress: true
 
 jobs:
@@ -45,7 +45,7 @@ jobs:
           pip install --upgrade pip
           pip install "git+https://github.com/unitedstates/congress.git"
 
-      # Nightly runs use --fast; weekly full refresh skips it.
+      # --- Votes (existing behaviour) ---
       - name: Run votes scraper (sessions 118–119)
         env:
           SESSIONS: "118.2023,118.2024,119.2025"
@@ -57,12 +57,12 @@ jobs:
             usc-run votes --sessions="${SESSIONS}" --log=info
           fi
 
-      - name: List scraped files
+      - name: List scraped vote files (debug)
         run: |
           echo "Listing vote JSON files…"
           find data -type f -path "*/votes/*/*/data.json" | sort | sed 's/^/  /' || true
 
-      - name: Validate files exist
+      - name: Validate vote files exist
         run: |
           set -e
           COUNT=$(find data -type f -path "*/votes/*/*/data.json" | wc -l | tr -d ' ')
@@ -72,28 +72,82 @@ jobs:
             exit 1
           fi
 
-      - name: Build manifest of vote JSON files
+      # --- Bills: fetch govinfo bulk and process bills + bill text ---
+      - name: Fetch GovInfo BILLSTATUS (118–119)
+        run: |
+          . env/bin/activate
+          usc-run govinfo --bulkdata=BILLSTATUS --congress=118,119 --log=info
+
+      - name: Process Bills (118–119)
+        run: |
+          . env/bin/activate
+          usc-run bills --congress=118,119 --log=info
+
+      - name: Fetch Bill Text (118–119)
+        run: |
+          . env/bin/activate
+          usc-run billtext --congress=118,119 --log=info
+
+      - name: List scraped bill files (debug)
+        run: |
+          echo "Listing bill metadata files…"
+          find data -type f -path "*/bills/*/data.json" | sort | sed 's/^/  /' || true
+          echo "Listing bill text files…"
+          find data -type f -path "*/bills/*/text-versions/*/data.json" | sort | sed 's/^/  /' || true
+
+      # --- Build manifests (votes, bills, billtext) ---
+      - name: Build manifests (votes, bills, billtext)
         run: |
           set -e
+
+          # votes manifest
           echo '{"files":[' > manifest.json
           first=true
-          # Each vote is data/[congress]/votes/[session]/[chamber][number]/data.json
           find data -type f -path "*/votes/*/*/data.json" | sort | while read -r f; do
             if [ "$first" = true ]; then first=false; else echo "," >> manifest.json; fi
             printf '"%s"' "$f" >> manifest.json
           done
           echo "]}" >> manifest.json
-          jq '.files | length as $n | "Manifest contains: \($n) files"' manifest.json
+          echo "Votes manifest built: $(jq '.files | length' manifest.json) files"
 
-      # Upload artifacts for n8n to fetch
+          # bills manifest
+          echo '{"files":[' > bills-manifest.json
+          first=true
+          find data -type f -path "*/bills/*/data.json" | sort | while read -r f; do
+            if [ "$first" = true ]; then first=false; else echo "," >> bills-manifest.json; fi
+            printf '"%s"' "$f" >> bills-manifest.json
+          done
+          echo "]}" >> bills-manifest.json
+          echo "Bills manifest built: $(jq '.files | length' bills-manifest.json) files"
+
+          # bill text manifest
+          echo '{"files":[' > billtext-manifest.json
+          first=true
+          find data -type f -path "*/bills/*/text-versions/*/data.json" | sort | while read -r f; do
+            if [ "$first" = true ]; then first=false; else echo "," >> billtext-manifest.json; fi
+            printf '"%s"' "$f" >> billtext-manifest.json
+          done
+          echo "]}" >> billtext-manifest.json
+          echo "BillText manifest built: $(jq '.files | length' billtext-manifest.json) files"
+
+      # --- Final validation (optional) ---
+      - name: Quick manifest counts for debug
+        run: |
+          echo "Votes files: $(jq '.files | length' manifest.json || echo 0)"
+          echo "Bills files: $(jq '.files | length' bills-manifest.json || echo 0)"
+          echo "BillText files: $(jq '.files | length' billtext-manifest.json || echo 0)"
+
+      # --- Archive everything for n8n to fetch ---
       - name: Archive data
         run: |
           mkdir -p out
-          zip -r out/votes-json.zip data manifest.json
-      - name: Upload artifact (votes JSON + manifest)
+          # include the data tree + manifests
+          zip -r out/congress-data.zip data manifest.json bills-manifest.json billtext-manifest.json
+
+      - name: Upload artifact (congress data)
         uses: actions/upload-artifact@v4
         with:
-          name: votes-json
-          path: out/votes-json.zip
+          name: congress-data
+          path: out/congress-data.zip
           if-no-files-found: error
           retention-days: 7
