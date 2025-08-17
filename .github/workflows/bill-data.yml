@@ -1,4 +1,4 @@
-name: Bill Data (118-119)
+name: Collect Bill Data (118-119)
 
 on:
   workflow_dispatch:
