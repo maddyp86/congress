@@ -1,4 +1,4 @@
-name: Package filtered bill files
+name: Bill Data (118-119)
 
 on:
   workflow_dispatch:
