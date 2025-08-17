@@ -3,8 +3,8 @@ name: Collect Bill Data (118-119)
 on:
   workflow_dispatch:
     inputs:
-      bill_keys:
-        description: 'Comma-separated bill keys, e.g. 118-s-270,119-s-45'
+      bill_id:
+        description: 'Comma-separated bill ids, e.g. 118-s-270,119-s-45'
         required: true
       artifact_prefix:
         description: 'artifact prefix (defaults filtered-bills)'
@@ -31,7 +31,7 @@ jobs:
 
       - name: Configure inputs
         run: |
-          echo "BILL_KEYS=${{ github.event.inputs.bill_keys }}" >> $GITHUB_ENV
+          echo "BILL_ID=${{ github.event.inputs.bill_id }}" >> $GITHUB_ENV
           echo "ART_PREFIX=${{ github.event.inputs.artifact_prefix }}" >> $GITHUB_ENV
 
       - name: Show repo top (debug)
@@ -43,7 +43,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p selected_files
-          IFS=',' read -ra KEYS <<< "${BILL_KEYS}"
+          IFS=',' read -ra KEYS <<< "${BILL_ID}"
           for k in "${KEYS[@]}"; do
             k=$(echo "$k" | tr -d '[:space:]')
             [ -z "$k" ] && continue
@@ -60,6 +60,7 @@ jobs:
             find data -type f -path "*/bills/${type}${number}/text-versions/*/data.json" -print0 \
               | xargs -0 -I{} cp --parents "{}" selected_files/ || true
           done
+          echo "Requested bill_id(s): ${BILL_ID}"
           echo "Selected files (first 200 lines):"
           find selected_files -type f | sed 's/^/  /' | head -n 200 || true
 
@@ -80,7 +81,7 @@ jobs:
             echo "Creating zip with ${filecount} files..."
             (cd selected_files && zip -r "../${outname}" .)
           else
-            echo "No files found for requested bill_keys; creating an empty zip"
+            echo "No files found for requested bill_id; creating an empty zip"
             tmpfile="$(mktemp)"
             printf '' > "${tmpfile}"
             zip -q "${outname}" "${tmpfile}"
