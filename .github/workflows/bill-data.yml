@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       bill_id:
-        description: 'Comma-separated bill ids, e.g. 118-s-270,119-s-45'
+        description: 'Comma-separated bill ids, e.g. 118-s-270,119-s-45 (congress required)'
         required: true
       artifact_prefix:
         description: 'artifact prefix (defaults filtered-bills)'
@@ -22,6 +22,7 @@ permissions:
 jobs:
   package:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
 
     steps:
       - name: Checkout repo
@@ -29,42 +30,145 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Install system libs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget python3-dev libxml2-dev libxslt1-dev libz-dev python3-venv jq zip
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/setup.py') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install package + deps
+        run: |
+          python -m venv env
+          . env/bin/activate
+          pip install --upgrade pip
+          pip install .
+
       - name: Configure inputs
         run: |
           echo "BILL_ID=${{ github.event.inputs.bill_id }}" >> $GITHUB_ENV
           echo "ART_PREFIX=${{ github.event.inputs.artifact_prefix }}" >> $GITHUB_ENV
 
-      - name: Show repo top (debug)
+      - name: Ensure data and selected_files exist
         run: |
-          echo "Top of repo:"
-          ls -la
+          mkdir -p data selected_files
 
-      - name: Build list of matching files and copy them
+      - name: Process bill_ids with per-congress govinfo fallback
+        id: process_bills
         run: |
           set -euo pipefail
-          mkdir -p selected_files
-          IFS=',' read -ra KEYS <<< "${BILL_ID}"
-          for k in "${KEYS[@]}"; do
-            k=$(echo "$k" | tr -d '[:space:]')
+          # BILL_ID: comma separated '118-s-270,119-s-45'
+          IFS=',' read -ra RAW_KEYS <<< "${BILL_ID}"
+
+          # normalize and validate input bill ids
+          CLEAN_KEYS=()
+          for raw in "${RAW_KEYS[@]}"; do
+            # remove spaces, dots; lowercase
+            k="$(echo "${raw}" | tr -d '[:space:]' | tr -d '.' | tr '[:upper:]' '[:lower:]')"
             [ -z "$k" ] && continue
-            # expect format: <congress>-<type>-<number> like 118-s-270
+            # require canonical form: digits-type-number (e.g. 118-s-270)
+            if echo "$k" | grep -qE '^[0-9]+-[a-z]+-[0-9]+'; then
+              CLEAN_KEYS+=("$k")
+            else
+              echo "::warning::Skipping malformed bill_id: '$raw' -> normalized '$k'"
+            fi
+          done
+
+          if [ ${#CLEAN_KEYS[@]} -eq 0 ]; then
+            echo "::error::No valid bill_id values found; exiting."
+            exit 1
+          fi
+
+          # associative array to track which congress we already fetched govinfo for
+          declare -A GOVINFO_FETCHED
+          . env/bin/activate
+
+          for k in "${CLEAN_KEYS[@]}"; do
+            echo "=== Processing bill: $k ==="
             congress=$(echo "$k" | cut -d'-' -f1)
             type=$(echo "$k" | cut -d'-' -f2)
             number=$(echo "$k" | cut -d'-' -f3)
-            # copy metadata file if present
+
+            # Attempt to run bills for this bill_id
+            if ./run bills --bill_id="$k" --log=info; then
+              echo "bills succeeded for $k"
+            else
+              echo "::warning::'./run bills' failed for $k - attempting govinfo fetch for congress ${congress} and retry"
+
+              # If we haven't already attempted govinfo for this congress, do it once
+              if [ -z "${GOVINFO_FETCHED[$congress]+x}" ]; then
+                echo "Fetching govinfo BILLSTATUS for congress ${congress}..."
+                if ./run govinfo --bulkdata=BILLSTATUS --congress="${congress}" --log=info; then
+                  GOVINFO_FETCHED[$congress]=1
+                  echo "govinfo fetch succeeded for congress ${congress}"
+                else
+                  GOVINFO_FETCHED[$congress]=0
+                  echo "::warning::govinfo fetch failed for congress ${congress}; bills for this congress may still fail"
+                fi
+              else
+                echo "govinfo already attempted for congress ${congress} (status: ${GOVINFO_FETCHED[$congress]})"
+              fi
+
+              # Retry the bills run once
+              if ./run bills --bill_id="$k" --log=info; then
+                echo "bills succeeded on retry for $k"
+              else
+                echo "::warning::bills still failed for $k after govinfo retry. Continuing to next bill."
+              fi
+            fi
+
+            # Run billtext (best-effort)
+            if ./run billtext --bill_id="$k" --log=info; then
+              echo "billtext succeeded for $k"
+            else
+              echo "::warning::'./run billtext' failed for $k"
+            fi
+
+            # small short sleep to be gentle on remote endpoints (optional)
+            # sleep 0.5
+          done
+
+      - name: Collect produced files into selected_files
+        run: |
+          set -euo pipefail
+          mkdir -p selected_files
+          IFS=',' read -ra RAW_KEYS <<< "${BILL_ID}"
+          for raw in "${RAW_KEYS[@]}"; do
+            k="$(echo "${raw}" | tr -d '[:space:]' | tr -d '.' | tr '[:upper:]' '[:lower:]')"
+            [ -z "$k" ] && continue
+            if ! echo "$k" | grep -qE '^[0-9]+-[a-z]+-[0-9]+'; then
+              continue
+            fi
+            congress=$(echo "$k" | cut -d'-' -f1)
+            type=$(echo "$k" | cut -d'-' -f2)
+            number=$(echo "$k" | cut -d'-' -f3)
+
             meta="data/${congress}/bills/${type}${number}/data.json"
             if [ -f "$meta" ]; then
               cp --parents "$meta" selected_files/
             fi
-            # copy all text versions for that bill
+
+            # copy any text-version data.json files for this bill
             find data -type f -path "*/bills/${type}${number}/text-versions/*/data.json" -print0 \
               | xargs -0 -I{} cp --parents "{}" selected_files/ || true
           done
-          echo "Requested bill_id(s): ${BILL_ID}"
-          echo "Selected files (first 200 lines):"
-          find selected_files -type f | sed 's/^/  /' | head -n 200 || true
 
-      - name: Create zip and upload
+          echo "Requested bill_id(s): ${BILL_ID}"
+          echo "Selected files (first 500 lines):"
+          find selected_files -type f | sed 's/^/  /' | head -n 500 || true
+
+      - name: Create zip and set output artifact_file
         id: makezip
         run: |
           set -euo pipefail
