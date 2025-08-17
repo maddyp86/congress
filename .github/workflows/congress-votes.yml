@@ -1,0 +1,93 @@
+
+name: Collect Congress Votes (118–119)
+
+on:
+  schedule:
+    # Nightly at 09:30 UTC = 02:30 PT
+    - cron: "30 9 * * *"
+    # Weekly full refresh, Sundays 03:00 PT
+    - cron: "00 10 * * 0"
+  workflow_dispatch:
+
+concurrency:
+  group: collect-votes
+  cancel-in-progress: true
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install system libs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget python3-dev libxml2-dev libxslt1-dev libz-dev python3-venv jq zip
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+      - name: Install congress tool from GitHub (usc-run)
+        run: |
+          python -m venv env
+          . env/bin/activate
+          pip install --upgrade pip
+          pip install "git+https://github.com/unitedstates/congress.git"
+      # Nightly runs use --fast; weekly full refresh skips it.
+      - name: Run votes scraper (sessions 118–119)
+        env:
+          SESSIONS: "118.2023,118.2024,119.2025"
+        run: |
+          . env/bin/activate
+          if [ "${{ github.event.schedule }}" = "30 9 * * *" ]; then
+            usc-run votes --sessions="${SESSIONS}" --fast --log=info
+          else
+            usc-run votes --sessions="${SESSIONS}" --log=info
+          fi
+      - name: List scraped files
+        run: |
+          echo "Listing vote JSON files…"
+          find data -type f -path "*/votes/*/*/data.json" | sort | sed 's/^/  /' || true
+      - name: Validate files exist
+        run: |
+          set -e
+          COUNT=$(find data -type f -path "*/votes/*/*/data.json" | wc -l | tr -d ' ')
+          echo "Found $COUNT vote JSON files"
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::error::No vote JSON files were generated. Check sessions or network."
+            exit 1
+          fi
+      - name: Build manifest of vote JSON files
+        run: |
+          set -e
+          echo '{"files":[' > manifest.json
+          first=true
+          # Each vote is data/[congress]/votes/[session]/[chamber][number]/data.json
+          find data -type f -path "*/votes/*/*/data.json" | sort | while read -r f; do
+            if [ "$first" = true ]; then first=false; else echo "," >> manifest.json; fi
+            printf '"%s"' "$f" >> manifest.json
+          done
+          echo "]}" >> manifest.json
+          jq '.files | length as $n | "Manifest contains: \($n) files"' manifest.json
+      # Upload artifacts for n8n to fetch
+      - name: Archive data
+        run: |
+          mkdir -p out
+          zip -r out/votes-json.zip data manifest.json
+      - name: Upload artifact (votes JSON + manifest)
+        uses: actions/upload-artifact@v4
+        with:
+          name: votes-json
+          path: out/votes-json.zip
+          if-no-files-found: error
+          retention-days: 7
