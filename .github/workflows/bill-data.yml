@@ -3,8 +3,8 @@ name: Collect Bill Data (118-119)
 on:
   workflow_dispatch:
     inputs:
-      bill_id:
-        description: 'Comma-separated bill ids, e.g. 118-s-270,119-s-45'
+      bill_keys:
+        description: 'Comma-separated bill keys, e.g. 118-s-270,119-s-45'
         required: true
       artifact_prefix:
         description: 'artifact prefix (defaults filtered-bills)'
@@ -22,6 +22,7 @@ permissions:
 jobs:
   package:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -30,7 +31,7 @@ jobs:
 
       - name: Configure inputs
         run: |
-          echo "BILL_ID=${{ github.event.inputs.bill_id }}" >> $GITHUB_ENV
+          echo "BILL_KEYS=${{ github.event.inputs.bill_keys }}" >> $GITHUB_ENV
           echo "ART_PREFIX=${{ github.event.inputs.artifact_prefix }}" >> $GITHUB_ENV
 
       - name: Show repo top (debug)
@@ -42,7 +43,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p selected_files
-          IFS=',' read -ra KEYS <<< "${BILL_ID}"
+          IFS=',' read -ra KEYS <<< "${BILL_KEYS}"
           for k in "${KEYS[@]}"; do
             k=$(echo "$k" | tr -d '[:space:]')
             [ -z "$k" ] && continue
@@ -59,24 +60,36 @@ jobs:
             find data -type f -path "*/bills/${type}${number}/text-versions/*/data.json" -print0 \
               | xargs -0 -I{} cp --parents "{}" selected_files/ || true
           done
-          echo "Selected files:"
-          find selected_files -type f | sed 's/^/  /' || true
+          echo "Selected files (first 200 lines):"
+          find selected_files -type f | sed 's/^/  /' | head -n 200 || true
 
       - name: Create zip and upload
         id: makezip
         run: |
-          set -e
+          set -euo pipefail
           timestamp=$(date -u "+%Y%m%dT%H%M%SZ")
           outname="${ART_PREFIX}-${timestamp}-${GITHUB_RUN_ID}.zip"
-          if [ -d selected_files ] && [ "$(find selected_files -type f | wc -l)" -gt 0 ]; then
-            (cd selected_files && zip -r "../$outname" .)
-            echo "artifact_file=$outname" >> $GITHUB_OUTPUT
-            ls -lh "$outname"
-          else
-            echo "No files found for requested bill_id; creating empty zip"
-            zip -r "$outname" --filesync --symlinks --junk-paths --quiet --filesync -- *
-            echo "artifact_file=$outname" >> $GITHUB_OUTPUT
+
+          # count files (safe even if directory doesn't exist)
+          filecount=0
+          if [ -d selected_files ]; then
+            filecount=$(find selected_files -type f | wc -l || true)
           fi
+
+          if [ "$filecount" -gt 0 ]; then
+            echo "Creating zip with ${filecount} files..."
+            (cd selected_files && zip -r "../${outname}" .)
+          else
+            echo "No files found for requested bill_keys; creating an empty zip"
+            tmpfile="$(mktemp)"
+            printf '' > "${tmpfile}"
+            zip -q "${outname}" "${tmpfile}"
+            rm -f "${tmpfile}"
+          fi
+
+          # expose zip path to subsequent steps
+          echo "artifact_file=${outname}" >> $GITHUB_OUTPUT
+          ls -lh "${outname}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
