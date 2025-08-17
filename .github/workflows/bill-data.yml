@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       bill_id:
-        description: 'Comma-separated bill ids, e.g. 118-s-270,119-s-45 (congress required)'
+        description: 'Comma-separated bill ids. Accepts either "118-s-270" or "sjres57-118" style. Example: "118-s-270, sjres57-118"'
         required: true
       artifact_prefix:
         description: 'artifact prefix (defaults filtered-bills)'
@@ -22,7 +22,7 @@ permissions:
 jobs:
   package:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
 
     steps:
       - name: Checkout repo
@@ -33,7 +33,7 @@ jobs:
       - name: Install system libs
         run: |
           sudo apt-get update
-          sudo apt-get install -y wget python3-dev libxml2-dev libxslt1-dev libz-dev python3-venv jq zip
+          sudo apt-get install -y wget python3-dev libxml2-dev libz-dev libxslt1-dev python3-venv jq zip
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -64,24 +64,55 @@ jobs:
         run: |
           mkdir -p data selected_files
 
-      - name: Process bill_ids with per-congress govinfo fallback
+      - name: Process bill_ids with flexible parsing + per-congress govinfo fallback
         id: process_bills
         run: |
           set -euo pipefail
-          # BILL_ID: comma separated '118-s-270,119-s-45'
+
+          # BILL_ID expected like: "118-s-270, sjres57-118, hr5009-118"
           IFS=',' read -ra RAW_KEYS <<< "${BILL_ID}"
 
-          # normalize and validate input bill ids
+          # arrays to hold canonical keys (congress-type-number) for subsequent processing
           CLEAN_KEYS=()
+
+          # helper: parse a single normalized token into congress/type/number
+          parse_token() {
+            token="$1"
+            # case A: already in congress-type-number (e.g., 118-s-270)
+            if echo "$token" | grep -qE '^[0-9]+-[a-z]+-[0-9]+'; then
+              congress=$(echo "$token" | cut -d'-' -f1)
+              type=$(echo "$token" | cut -d'-' -f2)
+              number=$(echo "$token" | cut -d'-' -f3)
+              echo "${congress}-${type}-${number}"
+              return 0
+            fi
+
+            # case B: typeNumber-congress (e.g., sjres57-118 or hr5009-118)
+            if echo "$token" | grep -qE '^[a-z]+[0-9]+-[0-9]+'; then
+              # split at the last '-' to get left (type+num) and congress
+              left=$(echo "$token" | sed -E 's/(.*)-([0-9]+)$/\1/')
+              congress=$(echo "$token" | sed -E 's/.*-([0-9]+)$/\1/')
+              # split left into letters and digits
+              type=$(echo "$left" | sed -E 's/^([a-z]+).*$/\1/')
+              number=$(echo "$left" | sed -E 's/^[a-z]+([0-9]+).*$/\1/')
+              if [ -n "$type" ] && [ -n "$number" ] && [ -n "$congress" ]; then
+                echo "${congress}-${type}-${number}"
+                return 0
+              fi
+            fi
+
+            # else: unsupported form
+            return 1
+          }
+
+          # normalize incoming tokens: remove spaces/dots, lowercase
           for raw in "${RAW_KEYS[@]}"; do
-            # remove spaces, dots; lowercase
-            k="$(echo "${raw}" | tr -d '[:space:]' | tr -d '.' | tr '[:upper:]' '[:lower:]')"
-            [ -z "$k" ] && continue
-            # require canonical form: digits-type-number (e.g. 118-s-270)
-            if echo "$k" | grep -qE '^[0-9]+-[a-z]+-[0-9]+'; then
-              CLEAN_KEYS+=("$k")
+            token="$(echo "${raw}" | tr -d '[:space:]' | tr -d '.' | tr '[:upper:]' '[:lower:]')"
+            [ -z "$token" ] && continue
+            if parsed="$(parse_token "$token")"; then
+              CLEAN_KEYS+=("$parsed")
             else
-              echo "::warning::Skipping malformed bill_id: '$raw' -> normalized '$k'"
+              echo "::warning::Skipping malformed bill_id: '${raw}' -> normalized '${token}'"
             fi
           done
 
@@ -90,8 +121,12 @@ jobs:
             exit 1
           fi
 
-          # associative array to track which congress we already fetched govinfo for
+          echo "Canonical bill_id list to process:"
+          for k in "${CLEAN_KEYS[@]}"; do echo "  $k"; done
+
+          # associative array to track per-congress govinfo fetch status
           declare -A GOVINFO_FETCHED
+
           . env/bin/activate
 
           for k in "${CLEAN_KEYS[@]}"; do
@@ -106,7 +141,7 @@ jobs:
             else
               echo "::warning::'./run bills' failed for $k - attempting govinfo fetch for congress ${congress} and retry"
 
-              # If we haven't already attempted govinfo for this congress, do it once
+              # If we haven't attempted govinfo for this congress, do it once
               if [ -z "${GOVINFO_FETCHED[$congress]+x}" ]; then
                 echo "Fetching govinfo BILLSTATUS for congress ${congress}..."
                 if ./run govinfo --bulkdata=BILLSTATUS --congress="${congress}" --log=info; then
@@ -120,7 +155,7 @@ jobs:
                 echo "govinfo already attempted for congress ${congress} (status: ${GOVINFO_FETCHED[$congress]})"
               fi
 
-              # Retry the bills run once
+              # Retry the bills run once (best effort)
               if ./run bills --bill_id="$k" --log=info; then
                 echo "bills succeeded on retry for $k"
               else
@@ -135,31 +170,42 @@ jobs:
               echo "::warning::'./run billtext' failed for $k"
             fi
 
-            # small short sleep to be gentle on remote endpoints (optional)
-            # sleep 0.5
+            # optional tiny sleep to be gentle on endpoints
+            # sleep 0.2
           done
 
       - name: Collect produced files into selected_files
         run: |
           set -euo pipefail
           mkdir -p selected_files
+          # use the canonical form stored in CLEAN_KEYS: read BILL_ID and remap tokens again
           IFS=',' read -ra RAW_KEYS <<< "${BILL_ID}"
           for raw in "${RAW_KEYS[@]}"; do
-            k="$(echo "${raw}" | tr -d '[:space:]' | tr -d '.' | tr '[:upper:]' '[:lower:]')"
-            [ -z "$k" ] && continue
-            if ! echo "$k" | grep -qE '^[0-9]+-[a-z]+-[0-9]+'; then
+            token="$(echo "${raw}" | tr -d '[:space:]' | tr -d '.' | tr '[:upper:]' '[:lower:]')"
+            # try to parse token both ways, reusing same parsing logic as above inline
+            if echo "$token" | grep -qE '^[0-9]+-[a-z]+-[0-9]+'; then
+              congress=$(echo "$token" | cut -d'-' -f1)
+              type=$(echo "$token" | cut -d'-' -f2)
+              number=$(echo "$token" | cut -d'-' -f3)
+            elif echo "$token" | grep -qE '^[a-z]+[0-9]+-[0-9]+'; then
+              left=$(echo "$token" | sed -E 's/(.*)-([0-9]+)$/\1/')
+              congress=$(echo "$token" | sed -E 's/.*-([0-9]+)$/\1/')
+              type=$(echo "$left" | sed -E 's/^([a-z]+).*$/\1/')
+              number=$(echo "$left" | sed -E 's/^[a-z]+([0-9]+).*$/\1/')
+            else
               continue
             fi
-            congress=$(echo "$k" | cut -d'-' -f1)
-            type=$(echo "$k" | cut -d'-' -f2)
-            number=$(echo "$k" | cut -d'-' -f3)
+
+            # guard
+            [ -z "${congress:-}" ] && continue
+            [ -z "${type:-}" ] && continue
+            [ -z "${number:-}" ] && continue
 
             meta="data/${congress}/bills/${type}${number}/data.json"
             if [ -f "$meta" ]; then
               cp --parents "$meta" selected_files/
             fi
 
-            # copy any text-version data.json files for this bill
             find data -type f -path "*/bills/${type}${number}/text-versions/*/data.json" -print0 \
               | xargs -0 -I{} cp --parents "{}" selected_files/ || true
           done
