@@ -1,0 +1,86 @@
+name: Package filtered bill files
+
+on:
+  workflow_dispatch:
+    inputs:
+      bill_id:
+        description: 'Comma-separated bill ids, e.g. 118-s-270,119-s-45'
+        required: true
+      artifact_prefix:
+        description: 'artifact prefix (defaults filtered-bills)'
+        required: false
+        default: 'filtered-bills'
+      ref_branch:
+        description: 'branch/ref to run against (default main)'
+        required: false
+        default: 'main'
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure inputs
+        run: |
+          echo "BILL_ID=${{ github.event.inputs.bill_id }}" >> $GITHUB_ENV
+          echo "ART_PREFIX=${{ github.event.inputs.artifact_prefix }}" >> $GITHUB_ENV
+
+      - name: Show repo top (debug)
+        run: |
+          echo "Top of repo:"
+          ls -la
+
+      - name: Build list of matching files and copy them
+        run: |
+          set -euo pipefail
+          mkdir -p selected_files
+          IFS=',' read -ra KEYS <<< "${BILL_ID}"
+          for k in "${KEYS[@]}"; do
+            k=$(echo "$k" | tr -d '[:space:]')
+            [ -z "$k" ] && continue
+            # expect format: <congress>-<type>-<number> like 118-s-270
+            congress=$(echo "$k" | cut -d'-' -f1)
+            type=$(echo "$k" | cut -d'-' -f2)
+            number=$(echo "$k" | cut -d'-' -f3)
+            # copy metadata file if present
+            meta="data/${congress}/bills/${type}${number}/data.json"
+            if [ -f "$meta" ]; then
+              cp --parents "$meta" selected_files/
+            fi
+            # copy all text versions for that bill
+            find data -type f -path "*/bills/${type}${number}/text-versions/*/data.json" -print0 \
+              | xargs -0 -I{} cp --parents "{}" selected_files/ || true
+          done
+          echo "Selected files:"
+          find selected_files -type f | sed 's/^/  /' || true
+
+      - name: Create zip and upload
+        id: makezip
+        run: |
+          set -e
+          timestamp=$(date -u "+%Y%m%dT%H%M%SZ")
+          outname="${ART_PREFIX}-${timestamp}-${GITHUB_RUN_ID}.zip"
+          if [ -d selected_files ] && [ "$(find selected_files -type f | wc -l)" -gt 0 ]; then
+            (cd selected_files && zip -r "../$outname" .)
+            echo "artifact_file=$outname" >> $GITHUB_OUTPUT
+            ls -lh "$outname"
+          else
+            echo "No files found for requested bill_id; creating empty zip"
+            zip -r "$outname" --filesync --symlinks --junk-paths --quiet --filesync -- *
+            echo "artifact_file=$outname" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: filtered-bills
+          path: ${{ steps.makezip.outputs.artifact_file }}
+          retention-days: 7
