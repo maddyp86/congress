@@ -41,7 +41,6 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          # adjust if you use requirements.txt / pyproject.toml instead of setup.py
           key: ${{ runner.os }}-pip-${{ hashFiles('**/setup.py','**/requirements.txt','**/pyproject.toml') }}
           restore-keys: |
             ${{ runner.os }}-pip-
@@ -163,13 +162,13 @@ PY
 
       # === MANIFESTS (robust JSON, local + HTTPS GCS variants) ===
       - name: Build manifests (votes, bills, billtext) - robust (fixed)
-  env:
-    GCS_BUCKET: ${{ env.GCS_BUCKET }}
-    GCS_PREFIX: ${{ env.GCS_PREFIX }}
-  run: |
-    set -euo pipefail
-    . env/bin/activate
-    python - <<'PY'
+        env:
+          GCS_BUCKET: ${{ env.GCS_BUCKET }}
+          GCS_PREFIX: ${{ env.GCS_PREFIX }}
+        run: |
+          set -euo pipefail
+          . env/bin/activate
+          python - <<'PY'
 import json, pathlib, os
 base = pathlib.Path("data")
 bucket = os.environ.get("GCS_BUCKET", "").rstrip("/")
@@ -220,7 +219,6 @@ PY
           echo "BillText files: $(jq '.files | length' billtext-manifest.json || echo 0)"
 
       # === GCP auth & upload ===
-      # DEFAULT AUTH (JSON key) - unchanged from your original flow.
       - name: Setup gcloud (service account - JSON key)
         uses: google-github-actions/setup-gcloud@v1
         with:
@@ -266,6 +264,29 @@ PY
           gsutil iam ch allUsers:roles/storage.objectViewer gs://${GCS_BUCKET}
           # Older ACL approach (may fail if uniform bucket-level access is enabled):
           # gsutil -m acl ch -r -u AllUsers:R gs://${GCS_BUCKET}/${PREFIX}/
+
+      - name: Verify sample GCS objects exist (fail if missing)
+        run: |
+          set -euo pipefail
+          echo "Verifying a few sample objects exist on GCS..."
+          SAMPLES=(
+            "gs://${GCS_BUCKET}/${GCS_PREFIX}/data/119/bills/sjres55/data.json"
+            "gs://${GCS_BUCKET}/${GCS_PREFIX}/data/119/votes/119-1/vote_119_1_00499/data.json"
+          )
+          MISSING=0
+          for s in "${SAMPLES[@]}"; do
+            echo "Checking $s"
+            if gsutil -q stat "$s"; then
+              echo "OK: $s"
+            else
+              echo "::error::Missing expected object: $s"
+              MISSING=1
+            fi
+          done
+          if [ "$MISSING" -ne 0 ]; then
+            echo "::error::One or more sample objects are missing from GCS."
+            exit 1
+          fi
 
       - name: Print summary (sample public URL if public)
         run: |
