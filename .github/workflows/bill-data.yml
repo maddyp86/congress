@@ -1,6 +1,6 @@
 name: Collect Bill & Vote Data (118-119)
 
-n:
+on:
   schedule:
     # Nightly at 09:30 UTC = 02:30 PT
     - cron: "30 9 * * *"
