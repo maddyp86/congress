@@ -2,9 +2,7 @@ name: Collect Congress Data (118-119)
 
 on:
   schedule:
-    # Nightly at 09:30 UTC = 02:30 PT
     - cron: "30 9 * * *"
-    # Weekly full refresh, Sundays 03:00 PT
     - cron: "00 10 * * 0"
   workflow_dispatch: {}
 
@@ -18,7 +16,7 @@ permissions:
 jobs:
   collect:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 120
 
     steps:
       - name: Checkout repo
@@ -56,37 +54,31 @@ jobs:
       - name: Configure env vars (from secrets or defaults)
         run: |
           set -euo pipefail
-          # defaults (can be overridden via repo secrets)
           if [ -n "${{ secrets.CONGRESSES }}" ]; then
             echo "CONGRESSES=${{ secrets.CONGRESSES }}" >> $GITHUB_ENV
           else
             echo "CONGRESSES=118,119" >> $GITHUB_ENV
           fi
-
           if [ -n "${{ secrets.SESSIONS }}" ]; then
             echo "SESSIONS=${{ secrets.SESSIONS }}" >> $GITHUB_ENV
           else
             echo "SESSIONS=118.2023,118.2024,119.2025" >> $GITHUB_ENV
           fi
-
           if [ -n "${{ secrets.GCS_BUCKET }}" ]; then
             echo "GCS_BUCKET=${{ secrets.GCS_BUCKET }}" >> $GITHUB_ENV
           else
             echo "GCS_BUCKET=congress-bill-data" >> $GITHUB_ENV
           fi
-
           if [ -n "${{ secrets.GCS_PREFIX }}" ]; then
             echo "GCS_PREFIX=${{ secrets.GCS_PREFIX }}" >> $GITHUB_ENV
           else
             echo "GCS_PREFIX=congress-data" >> $GITHUB_ENV
           fi
-
           if [ -n "${{ secrets.MAKE_PUBLIC }}" ]; then
             echo "MAKE_PUBLIC=${{ secrets.MAKE_PUBLIC }}" >> $GITHUB_ENV
           else
             echo "MAKE_PUBLIC=false" >> $GITHUB_ENV
           fi
-
           if [ -n "${{ secrets.GCP_PROJECT }}" ]; then
             echo "GCP_PROJECT=${{ secrets.GCP_PROJECT }}" >> $GITHUB_ENV
           else
@@ -97,21 +89,18 @@ jobs:
       - name: Ensure data dir
         run: mkdir -p data
 
-      # === VOTES ===
       - name: Decide votes mode (--fast vs full)
         id: votes_mode
         run: |
           set -euo pipefail
-          # Scheduled runs: use --fast unless it's the weekly full-refresh window (Sunday 10:00 UTC)
           if [ "${{ github.event_name }}" = "schedule" ]; then
-            DOW_HOUR="$(date -u '+%w %H')"   # Sunday=0
+            DOW_HOUR="$(date -u '+%w %H')"
             if [ "$DOW_HOUR" = "0 10" ]; then
               echo "mode=full" >> $GITHUB_OUTPUT
             else
               echo "mode=fast" >> $GITHUB_OUTPUT
             fi
           else
-            # manual runs -> full
             echo "mode=full" >> $GITHUB_OUTPUT
           fi
 
@@ -123,17 +112,14 @@ jobs:
           . env/bin/activate
           echo "Running votes scraper for SESSIONS=${SESSIONS}"
           if [ "${{ steps.votes_mode.outputs.mode }}" = "fast" ]; then
-            echo "Using --fast"
             usc-run votes --sessions="${SESSIONS}" --fast --log=info
           else
-            echo "Full votes run"
             usc-run votes --sessions="${SESSIONS}" --log=info
           fi
 
       - name: List scraped vote files (debug)
         run: |
           set -euo pipefail
-          echo "Listing vote JSON files…"
           find data -type f -path "*/votes/*/*/data.json" | sort | sed 's/^/  /' | head -n 200 || true
 
       - name: Validate vote files exist (warn/fail)
@@ -146,7 +132,6 @@ jobs:
             exit 1
           fi
 
-      # === BILLS ===
       - name: Fetch GovInfo BILLSTATUS
         run: |
           set -euo pipefail
@@ -168,54 +153,18 @@ jobs:
       - name: List scraped bill files (debug)
         run: |
           set -euo pipefail
-          echo "Listing bill metadata files…"
           find data -type f -path "*/bills/*/data.json" | sort | sed 's/^/  /' | head -n 200 || true
-          echo "Listing bill text files…"
           find data -type f -path "*/bills/*/text-versions/*/data.json" | sort | sed 's/^/  /' | head -n 200 || true
 
-      # === MANIFESTS (robust + correct GCS URLs) ===
-      - name: Build manifests (votes, bills, billtext) - robust
+      - name: Build manifests (script)
         env:
           GCS_BUCKET: ${{ env.GCS_BUCKET }}
           GCS_PREFIX: ${{ env.GCS_PREFIX }}
         run: |
           set -euo pipefail
           . env/bin/activate
-          python - <<'PY'
-import json, pathlib, os
-base = pathlib.Path("data")
-bucket = os.environ.get("GCS_BUCKET", "").rstrip("/")
-prefix = os.environ.get("GCS_PREFIX", "").strip("/")
-
-def gather(glob):
-    return sorted(str(p).replace("\\\\","/") for p in base.glob(glob) if p.is_file())
-
-manifests = {
-  "votes-manifest.json": gather("**/votes/*/*/data.json"),
-  "bills-manifest.json": gather("**/bills/*/data.json"),
-  "billtext-manifest.json": gather("**/bills/*/text-versions/*/data.json"),
-}
-
-for name, files in manifests.items():
-    with open(name, "w") as fh:
-        json.dump({"files": files}, fh)
-    print(f"{name} built: {len(files)} files")
-
-    # Build GCS HTTPS manifest variant (strip leading 'data/' so we don't end up with data/data/...)
-    gcs_files = []
-    for f in files:
-        rel = f[len("data/"):] if f.startswith("data/") else f
-        if bucket and prefix:
-            gcs_files.append(f"https://storage.googleapis.com/{bucket}/{prefix}/data/{rel}")
-        elif bucket:
-            gcs_files.append(f"https://storage.googleapis.com/{bucket}/{rel}")
-        else:
-            gcs_files.append("")
-    gcs_name = name.replace(".json", "-gcs.json")
-    with open(gcs_name, "w") as fh:
-        json.dump({"files": gcs_files}, fh)
-    print(f"{gcs_name} built: {len(gcs_files)} files")
-PY
+          # run script that builds both local manifests and the -gcs.json HTTPS manifests
+          python scripts/build_manifests.py
 
       - name: Quick manifest counts (debug)
         run: |
@@ -224,7 +173,6 @@ PY
           echo "Bills files: $(jq '.files | length' bills-manifest.json || echo 0)"
           echo "BillText files: $(jq '.files | length' billtext-manifest.json || echo 0)"
 
-      # === GCP auth & upload ===
       - name: Setup gcloud (service account - JSON key)
         uses: google-github-actions/setup-gcloud@v1
         with:
@@ -241,12 +189,8 @@ PY
           set -euo pipefail
           PREFIX="${GCS_PREFIX%/}"
           DEST="gs://${GCS_BUCKET}/${PREFIX}/data/"
-          echo "Syncing local data/ -> ${DEST}"
-          # incremental sync of the 'data' directory into gs://.../<prefix>/data/
           gsutil -m rsync -r data "${DEST}"
-          echo "Uploading manifests"
           gsutil cp votes-manifest.json votes-manifest-gcs.json bills-manifest.json bills-manifest-gcs.json billtext-manifest.json billtext-manifest-gcs.json "gs://${GCS_BUCKET}/${PREFIX}/"
-          # also upload a ZIP archive (keeps older workflow behaviour)
           mkdir -p out
           zip -r out/congress-data.zip data votes-manifest.json bills-manifest.json billtext-manifest.json
           gsutil cp out/congress-data.zip "gs://${GCS_BUCKET}/${PREFIX}/congress-data.zip"
@@ -256,14 +200,11 @@ PY
         run: |
           set -euo pipefail
           PREFIX="${GCS_PREFIX%/}"
-          echo "Setting public-read on uploaded objects under gs://${GCS_BUCKET}/${PREFIX}"
-          # Prefer IAM (works with uniform bucket-level access)
           gsutil iam ch allUsers:roles/storage.objectViewer "gs://${GCS_BUCKET}"
 
       - name: Verify sample GCS objects exist (warn/fail)
         run: |
           set -euo pipefail
-          # adjust samples as needed
           SAMPLES=(
             "gs://${GCS_BUCKET}/${GCS_PREFIX}/data/119/bills/sjres55/data.json"
             "gs://${GCS_BUCKET}/${GCS_PREFIX}/data/119/votes/119-1/vote_119_1_00499/data.json"
@@ -271,7 +212,6 @@ PY
           )
           MISSING=0
           for s in "${SAMPLES[@]}"; do
-            echo "Checking $s"
             if gsutil -q stat "$s"; then
               echo "OK: $s"
             else
@@ -281,9 +221,6 @@ PY
           done
           if [ "$MISSING" -ne 0 ]; then
             echo "::warning::One or more sample objects are missing from GCS (see above)."
-            # to fail the job on missing samples, uncomment the next line:
-            # exit 1
-          fi
 
       - name: Print summary (sample public URL if public)
         run: |
@@ -295,4 +232,3 @@ PY
             echo "Archive: https://storage.googleapis.com/${GCS_BUCKET}/${PREFIX}/congress-data.zip"
           else
             echo "Bucket is private; consumers must use GCS credentials or signed URLs to access objects."
-          fi
