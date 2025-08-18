@@ -181,10 +181,10 @@ jobs:
         run: |
           set -euo pipefail
           python - <<'PY'
-import json, pathlib, os
-base = pathlib.Path("data")
-bucket = os.environ.get("GCS_BUCKET", "").rstrip("/")
-prefix = os.environ.get("GCS_PREFIX", "").strip("/")
+          import json, pathlib, os
+          base = pathlib.Path("data")
+          bucket = os.environ.get("GCS_BUCKET", "").rstrip("/")
+          prefix = os.environ.get("GCS_PREFIX", "").strip("/")
 
 def gather(glob):
     return sorted(str(p).replace("\\\\","/") for p in base.glob(glob) if p.is_file())
