@@ -1,0 +1,219 @@
+name: Collect Bill & Vote Data (118-119)
+
+on:
+  schedule:
+    # Nightly at 09:30 UTC = 02:30 PT
+    - cron: "30 9 * * *"
+    # Weekly full refresh, Sundays 03:00 PT
+    - cron: "00 10 * * 0"
+  workflow_dispatch:
+    inputs:
+      congresses:
+        description: "Comma-separated congress numbers to fetch (e.g. 118,119)"
+        required: true
+        default: "118,119"
+      sessions:
+        description: "Comma-separated vote sessions (e.g. 118.2023,118.2024,119.2025)"
+        required: true
+        default: "118.2023,118.2024,119.2025"
+      gcs_bucket:
+        description: "GCS bucket name (default congress-bill-data)"
+        required: true
+        default: "congress-bill-data"
+      gcs_prefix:
+        description: "Path prefix in bucket (optional). e.g. congress-data"
+        required: false
+        default: "congress-data"
+      make_public:
+        description: "Make uploaded objects public-read? (true/false)"
+        required: false
+        default: "false"
+      gcp_project:
+        description: "GCP project id"
+        required: true
+    # note: service account JSON stored as secret GCP_SA_KEY
+
+permissions:
+  contents: read
+
+jobs:
+  collect_and_publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install system libs
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y wget python3-dev libxml2-dev libxslt1-dev libz-dev python3-venv jq zip
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/setup.py') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install congress tool (pip install .)
+        run: |
+          python -m venv env
+          . env/bin/activate
+          pip install --upgrade pip
+          pip install .
+
+      - name: Configure inputs
+        run: |
+          echo "CONGRESSES=${{ github.event.inputs.congresses }}" >> $GITHUB_ENV
+          echo "SESSIONS=${{ github.event.inputs.sessions }}" >> $GITHUB_ENV
+          echo "GCS_BUCKET=${{ github.event.inputs.gcs_bucket }}" >> $GITHUB_ENV
+          echo "GCS_PREFIX=${{ github.event.inputs.gcs_prefix }}" >> $GITHUB_ENV
+          echo "MAKE_PUBLIC=${{ github.event.inputs.make_public }}" >> $GITHUB_ENV
+          echo "GCP_PROJECT=${{ github.event.inputs.gcp_project }}" >> $GITHUB_ENV
+
+      - name: Ensure data dir
+        run: mkdir -p data
+
+      # === VOTES ===
+      - name: Run votes scraper (sessions)
+        env:
+          SESSIONS: ${{ env.SESSIONS }}
+        run: |
+          . env/bin/activate
+          echo "Running votes scraper for SESSIONS=${SESSIONS}"
+          usc-run votes --sessions="${SESSIONS}" --log=info
+
+      - name: List scraped vote files (debug)
+        run: |
+          echo "Listing vote JSON files…"
+          find data -type f -path "*/votes/*/*/data.json" | sort | sed 's/^/  /' || true
+
+      - name: Validate vote files exist (warn, don't fail)
+        run: |
+          COUNT=$(find data -type f -path "*/votes/*/*/data.json" | wc -l | tr -d ' ')
+          echo "Found $COUNT vote JSON files"
+
+      # === BILLS ===
+      - name: Fetch GovInfo BILLSTATUS (congresses)
+        run: |
+          . env/bin/activate
+          echo "Fetching govinfo BILLSTATUS for: ${CONGRESSES}"
+          ./run govinfo --bulkdata=BILLSTATUS --congress=${CONGRESSES} --log=info
+
+      - name: Process Bills (congresses)
+        run: |
+          . env/bin/activate
+          echo "Processing bills for congresses: ${CONGRESSES}"
+          ./run bills --congress=${CONGRESSES} --log=info
+
+      - name: Fetch Bill Text (congresses)
+        run: |
+          . env/bin/activate
+          echo "Processing bill text for congresses: ${CONGRESSES}"
+          ./run billtext --congress=${CONGRESSES} --log=info
+
+      - name: List scraped bill files (debug)
+        run: |
+          echo "Listing bill metadata files…"
+          find data -type f -path "*/bills/*/data.json" | sort | sed 's/^/  /' | head -n 200 || true
+          echo "Listing bill text files…"
+          find data -type f -path "*/bills/*/text-versions/*/data.json" | sort | sed 's/^/  /' | head -n 200 || true
+
+      # === MANIFESTS ===
+      - name: Build manifests (votes, bills, billtext)
+        run: |
+          set -e
+          # votes manifest
+          echo '{"files":[' > votes-manifest.json
+          first=true
+          find data -type f -path "*/votes/*/*/data.json" | sort | while read -r f; do
+            if [ "$first" = true ]; then first=false; else echo "," >> votes-manifest.json; fi
+            printf '"%s"' "$f" >> votes-manifest.json
+          done
+          echo "]}" >> votes-manifest.json
+          echo "Votes manifest built: $(jq '.files | length' votes-manifest.json) files"
+
+          # bills manifest
+          echo '{"files":[' > bills-manifest.json
+          first=true
+          find data -type f -path "*/bills/*/data.json" | sort | while read -r f; do
+            if [ "$first" = true ]; then first=false; else echo "," >> bills-manifest.json; fi
+            printf '"%s"' "$f" >> bills-manifest.json
+          done
+          echo "]}" >> bills-manifest.json
+          echo "Bills manifest built: $(jq '.files | length' bills-manifest.json) files"
+
+          # bill text manifest
+          echo '{"files":[' > billtext-manifest.json
+          first=true
+          find data -type f -path "*/bills/*/text-versions/*/data.json" | sort | while read -r f; do
+            if [ "$first" = true ]; then first=false; else echo "," >> billtext-manifest.json; fi
+            printf '"%s"' "$f" >> billtext-manifest.json
+          done
+          echo "]}" >> billtext-manifest.json
+          echo "BillText manifest built: $(jq '.files | length' billtext-manifest.json) files"
+
+      - name: Quick manifest counts (debug)
+        run: |
+          echo "Votes files: $(jq '.files | length' votes-manifest.json || echo 0)"
+          echo "Bills files: $(jq '.files | length' bills-manifest.json || echo 0)"
+          echo "BillText files: $(jq '.files | length' billtext-manifest.json || echo 0)"
+
+      # === DEBUG: sample output ===
+      - name: Debug sample (first few items)
+        run: |
+          echo "Sample votes file:"
+          head -n 3 $(jq -r '.files[0]' votes-manifest.json) || true
+          echo "Sample bill metadata file:"
+          head -n 3 $(jq -r '.files[0]' bills-manifest.json) || true
+
+      # === GCP auth & upload ===
+      - name: Setup gcloud (service account)
+        uses: google-github-actions/setup-gcloud@v1
+        with:
+          project_id: ${{ env.GCP_PROJECT }}
+          service_account_key: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Ensure bucket exists
+        run: |
+          gsutil ls -b gs://${GCS_BUCKET} >/dev/null 2>&1 || gsutil mb -p "${GCP_PROJECT}" gs://${GCS_BUCKET}
+
+      - name: Upload data tree to GCS (preserve paths)
+        run: |
+          set -e
+          PREFIX="${GCS_PREFIX%/}"
+          DEST="gs://${GCS_BUCKET}/${PREFIX}/data/"
+          echo "Uploading data/ -> ${DEST}"
+          # copy data directory
+          gsutil -m cp -r data "${DEST}"
+          # upload manifests at prefix root
+          gsutil cp votes-manifest.json bills-manifest.json billtext-manifest.json gs://${GCS_BUCKET}/${PREFIX}/
+
+      - name: (optional) Make uploaded objects public (convenience)
+        if: ${{ env.MAKE_PUBLIC == 'true' }}
+        run: |
+          PREFIX="${GCS_PREFIX%/}"
+          echo "Setting public-read on uploaded objects under gs://${GCS_BUCKET}/${PREFIX}"
+          gsutil -m acl ch -r -u AllUsers:R gs://${GCS_BUCKET}/${PREFIX}/
+
+      - name: Print summary (sample public URL if public)
+        run: |
+          PREFIX="${GCS_PREFIX%/}"
+          echo "Uploaded to gs://${GCS_BUCKET}/${PREFIX}/"
+          if [ "${MAKE_PUBLIC}" = "true" ]; then
+            echo "Example public URL:"
+            echo "https://storage.googleapis.com/${GCS_BUCKET}/${PREFIX}/data/119/bills/sjres55/data.json"
+            echo "https://storage.googleapis.com/${GCS_BUCKET}/${PREFIX}/data/119/votes/somevote/data.json"
+          else
+            echo "Bucket is private; n8n must use GCS credentials to fetch objects."
+          fi
