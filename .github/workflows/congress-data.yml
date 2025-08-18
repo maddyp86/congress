@@ -6,7 +6,7 @@ on:
     - cron: "30 9 * * *"
     # Weekly full refresh, Sundays 03:00 PT
     - cron: "00 10 * * 0"
-  workflow_dispatch:
+  workflow_dispatch: {}
 
 concurrency:
   group: collect-congress-data
@@ -115,7 +115,7 @@ jobs:
             echo "mode=full" >> $GITHUB_OUTPUT
           fi
 
-      - name: Run votes scraper (sessions 118–119)
+      - name: Run votes scraper (sessions)
         env:
           SESSIONS: ${{ env.SESSIONS }}
         run: |
@@ -147,19 +147,19 @@ jobs:
           fi
 
       # === BILLS ===
-      - name: Fetch GovInfo BILLSTATUS (118–119)
+      - name: Fetch GovInfo BILLSTATUS
         run: |
           set -euo pipefail
           . env/bin/activate
           usc-run govinfo --bulkdata=BILLSTATUS --congress=${CONGRESSES} --log=info
 
-      - name: Process Bills (118–119)
+      - name: Process Bills
         run: |
           set -euo pipefail
           . env/bin/activate
           usc-run bills --congress=${CONGRESSES} --log=info
 
-      - name: Fetch Bill Text (118–119)
+      - name: Fetch Bill Text
         run: |
           set -euo pipefail
           . env/bin/activate
@@ -230,18 +230,6 @@ PY
           project_id: ${{ env.GCP_PROJECT }}
           service_account_key: ${{ secrets.GCP_SA_KEY }}
 
-      # ALTERNATIVE AUTH (OIDC / Workload Identity Federation) - uncomment this block and remove the JSON-key step above
-      # - id: 'auth'
-      #   uses: 'google-github-actions/auth@v1'
-      #   with:
-      #     workload_identity_provider: 'projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/POOL_ID/providers/PROVIDER_ID'
-      #     service_account: 'github-actions-sa@PROJECT_ID.iam.gserviceaccount.com'
-      #
-      # - name: Setup gcloud (via OIDC)
-      #   uses: google-github-actions/setup-gcloud@v1
-      #   with:
-      #     project_id: ${{ env.GCP_PROJECT }}
-
       - name: Ensure bucket exists
         run: |
           set -euo pipefail
@@ -270,8 +258,6 @@ PY
           echo "Setting public-read on uploaded objects under gs://${GCS_BUCKET}/${PREFIX}"
           # Prefer IAM (works with uniform bucket-level access)
           gsutil iam ch allUsers:roles/storage.objectViewer "gs://${GCS_BUCKET}"
-          # If you prefer ACLs (not recommended with uniform bucket-level access):
-          # gsutil -m acl ch -r -u AllUsers:R "gs://${GCS_BUCKET}/${PREFIX}/"
 
       - name: Verify sample GCS objects exist (warn/fail)
         run: |
@@ -294,7 +280,7 @@ PY
           done
           if [ "$MISSING" -ne 0 ]; then
             echo "::warning::One or more sample objects are missing from GCS (see above)."
-            # do not fail the job by default; uncomment to fail instead:
+            # to fail the job on missing samples, uncomment the next line:
             # exit 1
           fi
 
