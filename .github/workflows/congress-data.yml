@@ -6,7 +6,7 @@ on:
     - cron: "30 9 * * *"
     # Weekly full refresh, Sundays 03:00 PT
     - cron: "00 10 * * 0"
-  workflow_dispatch: {}
+  workflow_dispatch:
 
 concurrency:
   group: collect-congress-data
