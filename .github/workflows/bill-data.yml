@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       bill_id:
-        description: 'Comma-separated bill ids. Accepts either "118-s-270" or "sjres57-118" style. Example: "118-s-270, sjres57-118"'
+        description: 'Comma-separated bill ids in repo format only (e.g. sjres57-118, hr5009-118). MUST be type+number-congress.'
         required: true
       artifact_prefix:
         description: 'artifact prefix (defaults filtered-bills)'
@@ -33,7 +33,7 @@ jobs:
       - name: Install system libs
         run: |
           sudo apt-get update
-          sudo apt-get install -y wget python3-dev libxml2-dev libz-dev libxslt1-dev python3-venv jq zip
+          sudo apt-get install -y wget python3-dev libxml2-dev libxslt1-dev libz-dev python3-venv jq zip
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -64,84 +64,51 @@ jobs:
         run: |
           mkdir -p data selected_files
 
-      - name: Process bill_ids with flexible parsing + per-congress govinfo fallback
+      - name: Process bill_ids (repo-format only) with per-congress govinfo fallback
         id: process_bills
         run: |
           set -euo pipefail
 
-          # BILL_ID expected like: "118-s-270, sjres57-118, hr5009-118"
+          # BILL_ID expected like: "sjres57-118,hr5009-118"
           IFS=',' read -ra RAW_KEYS <<< "${BILL_ID}"
 
-          # arrays to hold canonical keys (congress-type-number) for subsequent processing
           CLEAN_KEYS=()
-
-          # helper: parse a single normalized token into congress/type/number
-          parse_token() {
-            token="$1"
-            # case A: already in congress-type-number (e.g., 118-s-270)
-            if echo "$token" | grep -qE '^[0-9]+-[a-z]+-[0-9]+'; then
-              congress=$(echo "$token" | cut -d'-' -f1)
-              type=$(echo "$token" | cut -d'-' -f2)
-              number=$(echo "$token" | cut -d'-' -f3)
-              echo "${congress}-${type}-${number}"
-              return 0
-            fi
-
-            # case B: typeNumber-congress (e.g., sjres57-118 or hr5009-118)
-            if echo "$token" | grep -qE '^[a-z]+[0-9]+-[0-9]+'; then
-              # split at the last '-' to get left (type+num) and congress
-              left=$(echo "$token" | sed -E 's/(.*)-([0-9]+)$/\1/')
-              congress=$(echo "$token" | sed -E 's/.*-([0-9]+)$/\1/')
-              # split left into letters and digits
-              type=$(echo "$left" | sed -E 's/^([a-z]+).*$/\1/')
-              number=$(echo "$left" | sed -E 's/^[a-z]+([0-9]+).*$/\1/')
-              if [ -n "$type" ] && [ -n "$number" ] && [ -n "$congress" ]; then
-                echo "${congress}-${type}-${number}"
-                return 0
-              fi
-            fi
-
-            # else: unsupported form
-            return 1
-          }
-
-          # normalize incoming tokens: remove spaces/dots, lowercase
           for raw in "${RAW_KEYS[@]}"; do
             token="$(echo "${raw}" | tr -d '[:space:]' | tr -d '.' | tr '[:upper:]' '[:lower:]')"
             [ -z "$token" ] && continue
-            if parsed="$(parse_token "$token")"; then
-              CLEAN_KEYS+=("$parsed")
+            # only accept repo-style: letters+digits-hyphen-congress (e.g., sjres57-118)
+            if echo "$token" | grep -qE '^[a-z]+[0-9]+-[0-9]+$'; then
+              CLEAN_KEYS+=("$token")
             else
-              echo "::warning::Skipping malformed bill_id: '${raw}' -> normalized '${token}'"
+              echo "::warning::Skipping malformed bill_id (not repo-format): '${raw}' -> normalized '${token}'"
             fi
           done
 
           if [ ${#CLEAN_KEYS[@]} -eq 0 ]; then
-            echo "::error::No valid bill_id values found; exiting."
+            echo "::error::No valid repo-format bill_id values found; exiting."
             exit 1
           fi
 
-          echo "Canonical bill_id list to process:"
+          echo "Repo-format bill_id list to process:"
           for k in "${CLEAN_KEYS[@]}"; do echo "  $k"; done
 
-          # associative array to track per-congress govinfo fetch status
           declare -A GOVINFO_FETCHED
-
           . env/bin/activate
 
           for k in "${CLEAN_KEYS[@]}"; do
             echo "=== Processing bill: $k ==="
-            congress=$(echo "$k" | cut -d'-' -f1)
-            type=$(echo "$k" | cut -d'-' -f2)
-            number=$(echo "$k" | cut -d'-' -f3)
+            # Extract congress: token like "sjres57-118" -> congress is after last '-'
+            congress="$(echo "$k" | sed -E 's/.*-([0-9]+)$/\1/')"
+            left="$(echo "$k" | sed -E 's/-[0-9]+$//')"   # e.g. "sjres57"
+            type="$(echo "$left" | sed -E 's/^([a-z]+).*$/\1/')"   # e.g. "sjres"
+            number="$(echo "$left" | sed -E 's/^[a-z]+([0-9]+).*$/\1/')" # e.g. "57"
 
-            # Attempt to run bills for this bill_id
+            # Attempt to run bills for this repo-style bill_id (pass as-is)
             if ./run bills --bill_id="$k" --log=info; then
               echo "bills succeeded for $k"
             else
               echo "::warning::'./run bills' failed for $k - attempting govinfo fetch for congress ${congress} and retry"
 
-              # If we haven't attempted govinfo for this congress, do it once
               if [ -z "${GOVINFO_FETCHED[$congress]+x}" ]; then
                 echo "Fetching govinfo BILLSTATUS for congress ${congress}..."
                 if ./run govinfo --bulkdata=BILLSTATUS --congress="${congress}" --log=info; then
@@ -155,7 +122,7 @@ jobs:
                 echo "govinfo already attempted for congress ${congress} (status: ${GOVINFO_FETCHED[$congress]})"
               fi
 
-              # Retry the bills run once (best effort)
+              # Retry once
               if ./run bills --bill_id="$k" --log=info; then
                 echo "bills succeeded on retry for $k"
               else
@@ -163,14 +130,14 @@ jobs:
               fi
             fi
 
-            # Run billtext (best-effort)
+            # run billtext (best-effort)
             if ./run billtext --bill_id="$k" --log=info; then
               echo "billtext succeeded for $k"
             else
               echo "::warning::'./run billtext' failed for $k"
             fi
 
-            # optional tiny sleep to be gentle on endpoints
+            # optional gentle sleep
             # sleep 0.2
           done
 
@@ -178,28 +145,18 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p selected_files
-          # use the canonical form stored in CLEAN_KEYS: read BILL_ID and remap tokens again
           IFS=',' read -ra RAW_KEYS <<< "${BILL_ID}"
           for raw in "${RAW_KEYS[@]}"; do
             token="$(echo "${raw}" | tr -d '[:space:]' | tr -d '.' | tr '[:upper:]' '[:lower:]')"
-            # try to parse token both ways, reusing same parsing logic as above inline
-            if echo "$token" | grep -qE '^[0-9]+-[a-z]+-[0-9]+'; then
-              congress=$(echo "$token" | cut -d'-' -f1)
-              type=$(echo "$token" | cut -d'-' -f2)
-              number=$(echo "$token" | cut -d'-' -f3)
-            elif echo "$token" | grep -qE '^[a-z]+[0-9]+-[0-9]+'; then
-              left=$(echo "$token" | sed -E 's/(.*)-([0-9]+)$/\1/')
-              congress=$(echo "$token" | sed -E 's/.*-([0-9]+)$/\1/')
-              type=$(echo "$left" | sed -E 's/^([a-z]+).*$/\1/')
-              number=$(echo "$left" | sed -E 's/^[a-z]+([0-9]+).*$/\1/')
-            else
+            [ -z "$token" ] && continue
+            if ! echo "$token" | grep -qE '^[a-z]+[0-9]+-[0-9]+$'; then
               continue
             fi
 
-            # guard
-            [ -z "${congress:-}" ] && continue
-            [ -z "${type:-}" ] && continue
-            [ -z "${number:-}" ] && continue
+            congress="$(echo "$token" | sed -E 's/.*-([0-9]+)$/\1/')"
+            left="$(echo "$token" | sed -E 's/-[0-9]+$//')"
+            type="$(echo "$left" | sed -E 's/^([a-z]+).*$/\1/')"
+            number="$(echo "$left" | sed -E 's/^[a-z]+([0-9]+).*$/\1/')"
 
             meta="data/${congress}/bills/${type}${number}/data.json"
             if [ -f "$meta" ]; then
@@ -221,7 +178,6 @@ jobs:
           timestamp=$(date -u "+%Y%m%dT%H%M%SZ")
           outname="${ART_PREFIX}-${timestamp}-${GITHUB_RUN_ID}.zip"
 
-          # count files (safe even if directory doesn't exist)
           filecount=0
           if [ -d selected_files ]; then
             filecount=$(find selected_files -type f | wc -l || true)
@@ -238,7 +194,6 @@ jobs:
             rm -f "${tmpfile}"
           fi
 
-          # expose zip path to subsequent steps
           echo "artifact_file=${outname}" >> $GITHUB_OUTPUT
           ls -lh "${outname}"
 
