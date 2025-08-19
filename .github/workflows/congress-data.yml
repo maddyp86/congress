@@ -94,14 +94,13 @@ jobs:
         run: |
           set -euo pipefail
           . env/bin/activate
-          ./run govinfo --bulkdata=BILLSTATUS --congress="${CONGRESSES}"
+          usc-run govinfo --bulkdata=BILLSTATUS --congress="${CONGRESSES}"
 
       - name: Process bills
         run: |
           set -euo pipefail
           . env/bin/activate
-          chmod +x ./run || true
-          ./run bills
+          usc-run bills
 
       - name: Quick bills debug
         run: |
@@ -114,8 +113,8 @@ jobs:
         run: |
           set -euo pipefail
           . env/bin/activate
-          ./run govinfo --collections=BILLS --congress="${CONGRESSES}" --store=mods,xml,text --bulkdata=False
-          ./run billtext
+          usc-run govinfo --collections=BILLS --congress="${CONGRESSES}" --store=mods,xml,text --bulkdata=False
+          usc-run billtext
 
       - name: Quick billtext debug
         run: |
