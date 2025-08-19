@@ -1,10 +1,10 @@
-name: Collect Congress Data 118-119
+name: Collect Congress Data (118–119)
 
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "30 9 * * *"   # nightly
-    - cron: "00 10 * * 0"  # weekly full refresh
+    - cron: "30 9 * * *" # nightly (09:30 UTC)
+    - cron: "0 10 * * 0" # weekly full refresh (Sunday 10:00 UTC)
 
 concurrency:
   group: collect-congress-data
@@ -18,42 +18,46 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 240
 
+    # Defaults with secret fallbacks
     env:
-      # defaults (can be overridden by repo secrets in the Configure step)
-      CONGRESSES: "118,119"
-      SESSIONS: "118.2023,118.2024,119.2025"
-      GCS_BUCKET: "congress-bill-data"
-      GCS_PREFIX: "congress-data"
-      MAKE_PUBLIC: "false"
+      CONGRESSES: ${{ secrets.CONGRESSES || '118,119' }}
+      SESSIONS: ${{ secrets.SESSIONS || '118.2023,118.2024,119.2025' }}
+      GCS_BUCKET: ${{ secrets.GCS_BUCKET || 'congress-bill-data' }}
+      GCS_PREFIX: ${{ secrets.GCS_PREFIX || 'congress-data' }}
+      MAKE_PUBLIC: ${{ secrets.MAKE_PUBLIC || 'false' }}
+      GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 1
 
       - name: Install system libs
         run: |
+          set -euo pipefail
           sudo apt-get update -y
-          sudo apt-get install -y wget python3-venv jq zip
+          sudo apt-get install -y python3-venv jq zip
 
-      - name: Set up Python venv & install tool
+      - name: Set up Python 3.x
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+          cache: 'pip'
+
+      - name: Set up venv & install tool
         run: |
           set -euo pipefail
-          python3 -m venv env
+          python -m venv env
           . env/bin/activate
-          pip install --upgrade pip setuptools wheel
+          python -m pip install --upgrade pip wheel setuptools
           pip install -e .
 
-      - name: Configure inputs (from secrets or defaults)
+      - name: Verify required secrets
         run: |
           set -euo pipefail
-          if [ -n "${{ secrets.CONGRESSES }}" ]; then echo "CONGRESSES=${{ secrets.CONGRESSES }}" >> $GITHUB_ENV; fi
-          if [ -n "${{ secrets.SESSIONS }}" ]; then echo "SESSIONS=${{ secrets.SESSIONS }}" >> $GITHUB_ENV; fi
-          if [ -n "${{ secrets.GCS_BUCKET }}" ]; then echo "GCS_BUCKET=${{ secrets.GCS_BUCKET }}" >> $GITHUB_ENV; fi
-          if [ -n "${{ secrets.GCS_PREFIX }}" ]; then echo "GCS_PREFIX=${{ secrets.GCS_PREFIX }}" >> $GITHUB_ENV; fi
-          if [ -n "${{ secrets.MAKE_PUBLIC }}" ]; then echo "MAKE_PUBLIC=${{ secrets.MAKE_PUBLIC }}" >> $GITHUB_ENV; fi
-          if [ -n "${{ secrets.GCP_PROJECT }}" ]; then echo "GCP_PROJECT=${{ secrets.GCP_PROJECT }}" >> $GITHUB_ENV; else echo "::error::Missing GCP_PROJECT secret"; exit 1; fi
+          : "${GCP_PROJECT:?Missing required secret GCP_PROJECT}"
+          : "${{ secrets.GCP_SA_KEY }}"
 
       - name: Ensure data dir
         run: mkdir -p data
@@ -65,18 +69,17 @@ jobs:
         run: |
           set -euo pipefail
           . env/bin/activate
-            # If this job was triggered by the scheduled cron "30 9 * * *", run fast mode
-              if [ "${{ github.event.schedule }}" = "30 9 * * *" ]; then
-              usc-run votes --sessions="${SESSIONS}" --fast --log=info
-              else
-              usc-run votes --sessions="${SESSIONS}" --log=info
-              fi
+          if [ "${{ github.event.schedule }}" = "30 9 * * *" ]; then
+            usc-run votes --sessions="${SESSIONS}" --fast --log=info
+          else
+            usc-run votes --sessions="${SESSIONS}" --log=info
+          fi
 
       - name: Quick votes debug
         run: |
           set -euo pipefail
           echo "Votes files (sample):"
-          find data -type f -path "*/votes/*/*/data.json" | sort 2>/dev/null | sed 's/^/  /' 2>/dev/null | head -n 100 || true
+          find data -type f -path "*/votes/*/*/data.json" | sort | sed 's/^/  /' | head -n 100 || true
 
       # === BILLS (govinfo -> process) ===
       - name: Fetch GovInfo BILLSTATUS
@@ -96,7 +99,7 @@ jobs:
         run: |
           set -euo pipefail
           echo "Bill metadata files (sample):"
-          find data -type f -path "*/bills/*/data.json" | sort 2>/dev/null | sed 's/^/  /' 2>/dev/null | head -n 100 || true
+          find data -type f -path "*/bills/*/data.json" | sort | sed 's/^/  /' | head -n 100 || true
 
       # === BILL TEXT ===
       - name: Fetch GovInfo BILLS (text) and run billtext
@@ -110,10 +113,10 @@ jobs:
         run: |
           set -euo pipefail
           echo "Bill text (text-version data.json) sample:"
-          find data -type f -path "*/bills/*/text-versions/*/data.json" | sort 2>/dev/null | sed 's/^/  /' 2>/dev/null | head -n 100 || true
+          find data -type f -path "*/bills/*/text-versions/*/data.json" | sort | sed 's/^/  /' | head -n 100 || true
 
-      # === Build latest_data (one data.json per bill) ===
-      - name: Build latest_data (one most-recent data.json per bill)
+      # === Build latest_* exports ===
+      - name: Build latest_billtext (one most-recent text-version per bill)
         run: |
           set -euo pipefail
           . env/bin/activate
@@ -122,104 +125,113 @@ jobs:
           from datetime import datetime, timezone
 
           base = pathlib.Path("data")
-          out = pathlib.Path("latest_data")
+          out = pathlib.Path("latest_billtext")
           if out.exists():
-          shutil.rmtree(out)
+              shutil.rmtree(out)
           out.mkdir(parents=True, exist_ok=True)
+          
+          def parse_date(s):
+              if not s or not isinstance(s, str):
+                  return None
+              try:
+                  if s.endswith("Z"):
+                      s = s[:-1] + "+00:00"
+                  return datetime.fromisoformat(s)
+              except Exception:
+                  try:
+                      return datetime.fromisoformat(s.split("T")[0])
+                  except Exception:
+                      return None
+          
+          def mtime_dt(p):
+              try:
+                  return datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc)
+              except Exception:
+                  return datetime.fromtimestamp(0, tz=timezone.utc)
+          
+          for congress_dir in sorted([p for p in base.iterdir() if p.is_dir()]):
+              bills_root = congress_dir / "bills"
+              if not bills_root.exists():
+                  continue
+              for bill_dir in sorted([p for p in bills_root.iterdir() if p.is_dir()]):
+                  txt_root = bill_dir / "text-versions"
+                  if not txt_root.exists():
+                      continue
+                  best = None
+                  for ver in sorted([p for p in txt_root.iterdir() if p.is_dir()]):
+                      f = ver / "data.json"
+                      if not f.is_file():
+                          continue
+                      try:
+                          obj = json.load(open(f, "r"))
+                          dt = parse_date(obj.get("issued_on") or obj.get("issued") or obj.get("date"))
+                      except Exception:
+                          dt = None
+                      dt = dt or mtime_dt(f)
+                      cand = (dt, mtime_dt(f), f)
+                      if best is None or cand > best:
+                          best = cand
+                  if best:
+                      dest = out / congress_dir.name / "bills" / bill_dir.name
+                      dest.mkdir(parents=True, exist_ok=True)
+                      shutil.copy2(best[2], dest / "data.json")
+                      print(f"picked {best[2]} -> {dest/'data.json'}")
+          PY
 
-        def parse_date(s):
-          if not s or not isinstance(s, str):
-            return None
-          try:
-          if s.endswith("Z"):
-            s = s[:-1] + "+00:00"
-            return datetime.fromisoformat(s)
-          except Exception:
-            try:
-              return datetime.fromtimestamp(0, tz=timezone.utc) if not s else datetime.fromisoformat(s.split("T")[0])
-            except Exception:
-              return None
-
-def mtime_dt(p):
-    try:
-        return datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc)
-    except Exception:
-        return datetime.fromtimestamp(0, tz=timezone.utc)
-
-for congress_dir in sorted([p for p in base.iterdir() if p.is_dir()]):
-    bills_root = congress_dir / "bills"
-    if not bills_root.exists():
-        continue
-    for bill_dir in sorted([p for p in bills_root.iterdir() if p.is_dir()]):
-        tv_root = bill_dir / "text-versions"
-        if not tv_root.exists():
-            continue
-        best = None
-        for ver in sorted([p for p in tv_root.iterdir() if p.is_dir()]):
-            dataf = ver / "data.json"
-            if not dataf.is_file():
-                continue
-            dt = None
-            try:
-                obj = json.load(open(dataf))
-                dt = parse_date(obj.get("issued_on") or obj.get("issued") or obj.get("date"))
-            except Exception:
-                dt = None
-            if dt is None:
-                dt = mtime_dt(dataf)
-            tie = mtime_dt(dataf)
-            cand = (dt, tie, dataf)
-            if best is None or (cand[0] > best[0]) or (cand[0] == best[0] and cand[1] > best[1]):
-                best = cand
-        if best:
-            _, _, best_path = best
-            dest = out / congress_dir.name / "bills" / bill_dir.name
-            dest.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(best_path, dest / "data.json")
-            print(f"picked {best_path} -> {dest/'data.json'}")
-        else:
-            print(f"no text versions for {congress_dir.name}/{bill_dir.name}")
-PY
-
-      # === Manifests (local and GCS-URL variants) ===
-      - name: Build manifests (local + gcs URLs)
-        env:
-          GCS_BUCKET: ${{ env.GCS_BUCKET }}
-          GCS_PREFIX: ${{ env.GCS_PREFIX }}
+      - name: Build latest_bills (bill metadata mirror)
         run: |
           set -euo pipefail
           python - <<'PY'
-import json, pathlib, os
-base = pathlib.Path("data")
-bucket = os.environ.get("GCS_BUCKET","").rstrip("/")
-prefix = os.environ.get("GCS_PREFIX","").strip("/")
+          import pathlib, shutil
+          base = pathlib.Path("data")
+          out  = pathlib.Path("latest_bills")
+          if out.exists():
+          shutil.rmtree(out)
+            for f in base.rglob("bills/*/data.json"):
+            dest = out / f.parent.relative_to(base)
+            dest.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(f, dest / "data.json")
+            print("latest_bills built")
+          PY
 
-def gather(glob):
-    return sorted(str(p).replace("\\\\","/") for p in base.glob(glob) if p.is_file())
+      # === Manifests (local + GCS URLs that point to /data) ===
+      - name: Build manifests (local + gcs URLs)
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, pathlib, os
 
-manifests = {
-  "votes-manifest.json": gather("**/votes/*/*/data.json"),
-  "bills-manifest.json": gather("**/bills/*/data.json"),
-  "billtext-manifest.json": gather("**/bills/*/text-versions/*/data.json"),
-}
+          base = pathlib.Path("data")
+          bucket = os.environ.get("GCS_BUCKET","").rstrip("/")
+          prefix = os.environ.get("GCS_PREFIX","").strip("/")
 
-for name, files in manifests.items():
-    with open(name,"w") as fh:
-        json.dump({"files": files}, fh)
-    gcs_files = []
-    for f in files:
-        rel = f[len("data/"):] if f.startswith("data/") else f
-        if bucket and prefix:
-            gcs_files.append(f"https://storage.googleapis.com/{bucket}/{prefix}/data/{rel}")
-        elif bucket:
-            gcs_files.append(f"https://storage.googleapis.com/{bucket}/{rel}")
-        else:
-            gcs_files.append("")
-    gcs_name = name.replace(".json","-gcs.json")
-    with open(gcs_name,"w") as fh:
-        json.dump({"files": gcs_files}, fh)
-    print(f"{name} built: {len(files)} files; {gcs_name}: {len(gcs_files)} files")
-PY
+          def gather(pattern):
+              # Pattern is relative (e.g., 'votes/*/*/data.json'); search anywhere under base.
+              return sorted(str(p).replace("\\","/") for p in base.rglob(pattern) if p.is_file())
+          
+          manifests = {
+            "votes-manifest.json": gather("votes/*/*/data.json"),
+            "bills-manifest.json": gather("bills/*/data.json"),
+            "billtext-manifest.json": gather("bills/*/text-versions/*/data.json"),
+          }
+
+          for name, files in manifests.items():
+              with open(name,"w") as fh:
+                  json.dump({"files": files}, fh)
+              gcs_files = []
+              for f in files:
+                  rel = f[len("data/"):] if f.startswith("data/") else f
+                  if bucket and prefix:
+                      gcs_files.append(f"https://storage.googleapis.com/{bucket}/{prefix}/data/{rel}")
+                  elif bucket:
+                      gcs_files.append(f"https://storage.googleapis.com/{bucket}/{rel}")
+                  else:
+                      gcs_files.append("")
+              gcs_name = name.replace(".json","-gcs.json")
+              with open(gcs_name,"w") as fh:
+                  json.dump({"files": gcs_files}, fh)
+              print(f"{name} built: {len(files)} files; {gcs_name}: {len(gcs_files)} files")
+          PY
 
       - name: Quick manifest counts
         run: |
@@ -230,61 +242,70 @@ PY
 
       # === GCP auth + upload ===
       - name: Authenticate to GCP (service account)
-        uses: google-github-actions/auth@v1
+        uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
       - name: Setup gcloud (sets project)
-        uses: google-github-actions/setup-gcloud@v1
+        uses: google-github-actions/setup-gcloud@v2
         with:
           project_id: ${{ env.GCP_PROJECT }}
-          version: latest
+          version: '>= 472.0.0'
 
       - name: Ensure bucket exists
         run: |
           set -euo pipefail
           gsutil ls -b "gs://${GCS_BUCKET}" >/dev/null 2>&1 || gsutil mb -p "${GCP_PROJECT}" "gs://${GCS_BUCKET}"
 
-      - name: Upload latest_data & manifests to GCS
+      - name: Upload data, latest_* & manifests to GCS
         run: |
           set -euo pipefail
           PREFIX="${GCS_PREFIX%/}"
-          # upload only the distilled latest_data (one file per bill) and manifests
-          if [ -d latest_data ]; then
-            echo "Uploading latest_data -> gs://${GCS_BUCKET}/${PREFIX}/latest/"
-            gsutil -m cp -r latest_data/* "gs://${GCS_BUCKET}/${PREFIX}/latest/"
-          else
-            echo "No latest_data to upload."
-          fi
+
+          # Full tree: ALL bills, ALL bill text versions, and ALL votes
+          echo "Sync full data -> gs://${GCS_BUCKET}/${PREFIX}/data/"
+          gsutil -m rsync -r -d data "gs://${GCS_BUCKET}/${PREFIX}/data"
+
+          # Convenience “latest” folders
+          for SRC in latest_billtext latest_bills; do
+            if [ -d "$SRC" ]; then
+              SUB="${SRC#latest_}"  # billtext or bills
+              echo "Uploading $SRC -> gs://${GCS_BUCKET}/${PREFIX}/latest/${SUB}/"
+              gsutil -m cp -r "$SRC"/* "gs://${GCS_BUCKET}/${PREFIX}/latest/${SUB}/"
+            fi
+          done
+
           echo "Uploading manifests -> gs://${GCS_BUCKET}/${PREFIX}/"
-          gsutil cp votes-manifest.json votes-manifest-gcs.json bills-manifest.json bills-manifest-gcs.json billtext-manifest.json billtext-manifest-gcs.json "gs://${GCS_BUCKET}/${PREFIX}/" || true
+          gsutil cp votes-manifest.json votes-manifest-gcs.json \
+                   bills-manifest.json bills-manifest-gcs.json \
+                   billtext-manifest.json billtext-manifest-gcs.json \
+                   "gs://${GCS_BUCKET}/${PREFIX}/" || true
 
       - name: Make uploaded objects public (optional)
         if: ${{ env.MAKE_PUBLIC == 'true' }}
         run: |
           set -euo pipefail
-          # set bucket to public-reader (object viewer) — requires owner/iam rights
           gsutil iam ch allUsers:roles/storage.objectViewer "gs://${GCS_BUCKET}"
 
       - name: Verify sample objects (warning only)
+        continue-on-error: true
         run: |
           set -euo pipefail
           SAMPLES=(
-            "gs://${GCS_BUCKET}/${GCS_PREFIX}/latest/119/bills/sjres55/data.json"
-            "gs://${GCS_BUCKET}/${GCS_PREFIX}/latest/119/votes/119-1/vote_119_1_00499/data.json"
+            "gs://${GCS_BUCKET}/${GCS_PREFIX}/data/119/bills/sjres55/data.json"                     # bill metadata
+            "gs://${GCS_BUCKET}/${GCS_PREFIX}/latest/billtext/119/bills/sjres55/data.json"        # latest bill text
+            "gs://${GCS_BUCKET}/${GCS_PREFIX}/data/119/votes/119-1/vote_119_1_00499/data.json"    # vote record
           )
           for s in "${SAMPLES[@]}"; do
-            if gsutil -q stat "$s"; then
-              echo "OK: $s"
-            else
-              echo "::warning::Missing or inaccessible: $s"
-            fi
+            gsutil -q stat "$s" && echo "OK: $s" || echo "::warning::Missing or inaccessible: $s"
           done
 
       - name: Summary
         run: |
           set -euo pipefail
-          echo "Uploaded (bucket): ${GCS_BUCKET}"
+          COUNT_TEXT=$(find latest_billtext -type f -name data.json 2>/dev/null | wc -l || true)
+          COUNT_BILLS=$(find latest_bills -type f -name data.json 2>/dev/null | wc -l || true)
+          echo "Uploaded bucket: ${GCS_BUCKET}"
           echo "Prefix: ${GCS_PREFIX}"
-          echo "Latest_data count:"
-          find latest_data -type f -name data.json | wc -l || true
+          echo "latest_billtext count: ${COUNT_TEXT}"
+          echo "latest_bills count: ${COUNT_BILLS}"
