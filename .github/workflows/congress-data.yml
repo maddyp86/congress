@@ -39,25 +39,33 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y python3-venv jq zip
 
-      - name: Set up Python 3.x
+# ==== Python setup + pip cache + install congress tool (usc-run) ====
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.x'
-          cache: 'pip'
+          python-version: "3.11"
 
-      - name: Set up venv & install tool
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install congress tool from GitHub (usc-run)
         run: |
           set -euo pipefail
           python -m venv env
           . env/bin/activate
-          python -m pip install --upgrade pip wheel setuptools
-          pip install -e .
+          python -m pip install --upgrade pip
+          pip install "git+https://github.com/unitedstates/congress.git"
 
-      - name: Verify required secrets
+      - name: Verify required env
         run: |
           set -euo pipefail
           : "${GCP_PROJECT:?Missing required secret GCP_PROJECT}"
-          : "${{ secrets.GCP_SA_KEY }}"
+          : "${GCS_BUCKET:?Missing required GCS_BUCKET}"
 
       - name: Ensure data dir
         run: mkdir -p data
