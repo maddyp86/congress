@@ -16,7 +16,6 @@ permissions:
 jobs:
   collect_and_publish:
     runs-on: ubuntu-latest
-    timeout-minutes: 240
 
     # Defaults with secret fallbacks
     env:
