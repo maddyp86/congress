@@ -62,11 +62,11 @@ jobs:
           set -euo pipefail
           : "${GCP_PROJECT:?Missing required secret GCP_PROJECT}"
           : "${GCS_BUCKET:?Missing required GCS_BUCKET}"
-      
+
       - name: Ensure Data Dir
         run: mkdir -p data
 
-      - name: Fetch GovInfo BILLS Text
+      - name: Fetch GovInfo BILLS Text & build billtext
         run: |
           set -euo pipefail
           . env/bin/activate
@@ -84,22 +84,13 @@ jobs:
           echo "Bill text (text-version data.json) sample:"
           { find data -type f -path "*/bills/*/text-versions/*/data.json" | sort | sed 's/^/  /' | head -n 100; } 2>/dev/null || true
 
-      - name: Build Latest Bill Text
-        run: |
-          set -euo pipefail
-          . env/bin/activate
-          python scripts/latest-bill-text.py
-
-      - name: Build Manifests
-        run: |
-          set -euo pipefail
-          . env/bin/activate
-          python scripts/build_manifests.py
-
       - name: Quick Manifest Count
         run: |
           set -euo pipefail
-          echo "BillText files: $(jq '.files | length' billtext-manifest.json || echo 0)"
+          echo "BillText files (from latest_billtext): $(jq '.files | length' billtext-manifest.json || echo 0)"
+
+      # NOTE: We no longer mirror the raw bills/ tree, so we don't upload package.zip/html/pdf/xml.
+      # Instead, we only publish the curated latest_billtext JSONs to a short path: <prefix>/billtext/
 
       # --- GCP auth + upload (BILL TEXT ONLY) ---
       - name: Authenticate to GCP
@@ -118,30 +109,21 @@ jobs:
           set -euo pipefail
           gsutil ls -b "gs://${GCS_BUCKET}" >/dev/null 2>&1 || gsutil mb -p "${GCP_PROJECT}" "gs://${GCS_BUCKET}"
 
-      - name: Upload Bill Text to GCS
+      - name: Upload latest bill text JSON (short path)
         run: |
           set -euo pipefail
           PREFIX="${GCS_PREFIX%/}"
-          for C in data/*; do
-            [ -d "$C/bills" ] || continue
-            CONS=$(basename "$C")
-            echo "Sync bills (incl. text-versions) for Congress ${CONS} -> gs://${GCS_BUCKET}/${PREFIX}/data/${CONS}/bills/"
-            # no -d to avoid deleting bill metadata uploaded by the bills workflow
-            gsutil -m rsync -r "$C/bills" "gs://${GCS_BUCKET}/${PREFIX}/data/${CONS}/bills"
-          done
-
-          if [ -d latest_billtext ]; then
-            echo "Uploading latest_billtext -> gs://${GCS_BUCKET}/${PREFIX}/latest/billtext/"
-            gsutil -m cp -r latest_billtext/* "gs://${GCS_BUCKET}/${PREFIX}/latest/billtext/"
+          if [ ! -d latest_billtext ]; then
+            echo "::error::latest_billtext not found (did scripts/latest-bill-text.py run?)"
+            exit 1
           fi
-
-          echo "Uploading billtext manifests -> gs://${GCS_BUCKET}/${PREFIX}/"
-          gsutil cp billtext-manifest.json billtext-manifest-gcs.json "gs://${GCS_BUCKET}/${PREFIX}/" || true
+          echo "Sync latest_billtext -> gs://${GCS_BUCKET}/${PREFIX}/billtext/"
+          gsutil -m rsync -r -d latest_billtext "gs://${GCS_BUCKET}/${PREFIX}/billtext"
 
       - name: Summary
         run: |
           set -euo pipefail
-          COUNT_TEXT=$(jq '.files | length' billtext-manifest.json 2>/dev/null || echo 0)
+          COUNT_TEXT=$(find latest_billtext -type f -name data.json 2>/dev/null | wc -l || true)
           echo "Uploaded bucket: ${GCS_BUCKET}"
           echo "Prefix: ${GCS_PREFIX}"
-          echo "BillText files (manifest): ${COUNT_TEXT}"
+          echo "latest billtext JSON count: ${COUNT_TEXT}"
