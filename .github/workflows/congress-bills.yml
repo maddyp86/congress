@@ -20,8 +20,8 @@ jobs:
 
     env:
       CONGRESSES: ${{ secrets.CONGRESSES || '118,119' }}
-      GCS_BUCKET: ${{ secrets.GCS_BUCKET || 'congress-bill-data' }}
-      GCS_PREFIX: ${{ secrets.GCS_PREFIX || 'congress-data' }}
+      GCS_BUCKET: ${{ secrets.GCS_BUCKET || 'congress-data' }}
+      GCS_PREFIX: ${{ secrets.GCS_PREFIX || 'congress-bill-data' }}
       GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
 
     steps:
