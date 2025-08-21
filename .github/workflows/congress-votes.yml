@@ -22,7 +22,7 @@ jobs:
       CONGRESSES: ${{ secrets.CONGRESSES || '118,119' }}
       SESSIONS: ${{ secrets.SESSIONS || '118.2023,118.2024,119.2025' }}
       GCS_BUCKET: ${{ secrets.GCS_BUCKET || 'congress-bill-data' }}
-      GCS_PREFIX: ${{ secrets.GCS_PREFIX || 'congress-data' }}
+      GCS_PREFIX: ${{ secrets.GCS_PREFIX || 'congress-vote-data' }}
       GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
 
     steps:
