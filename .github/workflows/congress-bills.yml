@@ -84,16 +84,14 @@ jobs:
           echo "Bill metadata files (sample):"
           { find data -type f -path "*/bills/*/data.json" | sort | sed 's/^/  /' | head -n 100; } 2>/dev/null || true
 
-      - name: Build Manifests
-        run: |
-          set -euo pipefail
-          . env/bin/activate
-          python scripts/build_manifests.py
-
       - name: Quick Manifest Count
         run: |
           set -euo pipefail
-          echo "Bills files: $(jq '.files | length' bills-manifest.json || echo 0)"
+          if [ -f bills-manifest.json ]; then
+            echo "Bills files: $(jq '.files | length' bills-manifest.json || echo 0)"
+          else
+            echo "Bills manifest not found locally; skipping count."
+          fi
 
       # --- GCP auth + upload (BILLS ONLY) ---
       - name: Authenticate to GCP
@@ -119,9 +117,9 @@ jobs:
           for C in data/*; do
             [ -d "$C/bills" ] || continue
             CONS=$(basename "$C")
-            echo "Sync bills for Congress ${CONS} -> gs://${GCS_BUCKET}/${PREFIX}/data/${CONS}/bills/"
+            echo "Sync bills for Congress ${CONS} -> gs://${GCS_BUCKET}/${PREFIX}/bills/${CONS}/"
             # no -d to avoid deleting text-versions that may be uploaded by the billtext workflow
-            gsutil -m rsync -r "$C/bills" "gs://${GCS_BUCKET}/${PREFIX}/data/${CONS}/bills"
+            gsutil -m rsync -r -d "$C/bills" "gs://${GCS_BUCKET}/${PREFIX}/bills/${CONS}/"
           done
 
           echo "Uploading bills manifests -> gs://${GCS_BUCKET}/${PREFIX}/"
