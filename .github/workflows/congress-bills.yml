@@ -62,8 +62,7 @@ jobs:
           set -euo pipefail
           : "${GCP_PROJECT:?Missing required secret GCP_PROJECT}"
           : "${GCS_BUCKET:?Missing required GCS_BUCKET}"
-          test -n "${{ secrets.GCP_SA_KEY }}" || { echo "Missing required secret GCP_SA_KEY"; exit 1; }
-
+          
       - name: Ensure data dir
         run: mkdir -p data
 
