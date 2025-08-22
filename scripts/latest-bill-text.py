@@ -1,75 +1,94 @@
 #!/usr/bin/env python3
 # scripts/latest-bill-text.py
-# Build one most-recent text-version data.json per bill into latest_billtext/
+# Build a distilled latest_billtext/ tree: one data.json (most-recent) per bill.
 
 import json
-from pathlib import Path
-from datetime import datetime, timezone
+import pathlib
 import shutil
+from datetime import datetime, timezone
 
-base = Path("data")
-out = Path("latest_billtext")  # <- matches workflow upload path
+base = pathlib.Path("data")
+out = pathlib.Path("latest_billtext")
+
+# Remove old output and recreate
 if out.exists():
     shutil.rmtree(out)
 out.mkdir(parents=True, exist_ok=True)
 
-def parse_date(s: str):
-    """Parse ISO-ish dates from bill text JSON ('issued_on'/'issued'/'date').
-    Returns a timezone-aware UTC datetime, or None."""
+def parse_date(s):
     if not s or not isinstance(s, str):
         return None
     try:
-        # Handle trailing Z by converting to +00:00 so fromisoformat accepts it
         if s.endswith("Z"):
-            s = s[:-1] + "+00:00"
-        dt = datetime.fromisoformat(s)
+            s2 = s[:-1] + "+00:00"
+            return datetime.fromisoformat(s2)
+        return datetime.fromisoformat(s)
     except Exception:
-        # Fall back to YYYY-MM-DD if present
         try:
-            dt = datetime.fromisoformat(s.split("T")[0])
+            # fallback: parse date-only forms
+            return datetime.fromisoformat(s.split("T")[0])
         except Exception:
             return None
-    # Normalize to aware UTC
-    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
-def mtime_dt(p: Path):
-    """File mtime as aware UTC datetime (stable tiebreaker)."""
+def mtime_dt(p: pathlib.Path):
     try:
         return datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc)
     except Exception:
         return datetime.fromtimestamp(0, tz=timezone.utc)
 
-for congress_dir in sorted([p for p in base.iterdir() if p.is_dir()]):
-    bills_root = congress_dir / "bills"
-    if not bills_root.exists():
+# find all candidate data.json files under any text-versions folder
+candidates = list(base.rglob("**/text-versions/*/data.json"))
+
+# Organize by (congress, bill_id)
+groups = {}  # key -> list of pathlib.Path objects
+for p in candidates:
+    parts = p.parts
+    # find where 'text-versions' occurs
+    if "text-versions" not in parts:
         continue
-    for bill_dir in sorted([p for p in bills_root.iterdir() if p.is_dir()]):
-        tv_root = bill_dir / "text-versions"
-        if not tv_root.exists():
-            print(f"no text versions for {congress_dir.name}/{bill_dir.name}")
-            continue
+    ti = parts.index("text-versions")
+    # bill_id is two parts before text-versions (e.g., .../<type>/<bill_id>/text-versions/...)
+    if ti >= 2:
+        congress = parts[1] if parts[0] == "data" else parts[0]
+        bill_id = parts[ti - 2]
+        key = f"{congress}/{bill_id}"
+        groups.setdefault(key, []).append(p)
+    else:
+        # unexpected layout: skip
+        continue
 
-        best = None  # (issued_dt, tie_dt, path)
-        for ver in sorted([p for p in tv_root.iterdir() if p.is_dir()]):
-            dataf = ver / "data.json"
-            if not dataf.is_file():
-                continue
-            issued_dt = None
-            try:
-                with open(dataf, "r") as fh:
-                    obj = json.load(fh)
-                issued_dt = parse_date(obj.get("issued_on") or obj.get("issued") or obj.get("date"))
-            except Exception:
-                issued_dt = None
-            if issued_dt is None:
-                issued_dt = mtime_dt(dataf)
-            tie_dt = mtime_dt(dataf)
-            cand = (issued_dt, tie_dt, dataf)
-            if best is None or cand > best:
-                best = cand
+# For each bill, pick the best data.json
+picked = 0
+for key, plist in sorted(groups.items()):
+    best = None  # tuple (dt_primary, dt_tie, path)
+    for p in plist:
+        dt_primary = None
+        try:
+            with p.open("r", encoding="utf-8") as fh:
+                obj = json.load(fh)
+            dt_primary = (obj.get("issued_on") or obj.get("issued") or obj.get("date"))
+            dt_primary = parse_date(dt_primary)
+        except Exception:
+            dt_primary = None
 
-        if best:
-            dest = out / congress_dir.name / "bills" / bill_dir.name
-            dest.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(best[2], dest / "data.json")
-            print(f"picked {best[2]} -> {dest/'data.json'}")
+        if dt_primary is None:
+            dt_primary = mtime_dt(p)
+
+        tie = mtime_dt(p)
+        cand = (dt_primary, tie, p)
+        if best is None or (cand[0] > best[0]) or (cand[0] == best[0] and cand[1] > best[1]):
+            best = cand
+
+    if best:
+        dt, tie, best_path = best
+        # prepare destination: latest_billtext/<congress>/bills/<bill_id>/data.json
+        congress, bill_id = key.split("/", 1)
+        dest = out / congress / "bills" / bill_id
+        dest.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(best_path, dest / "data.json")
+        picked += 1
+        print(f"picked {best_path} -> {dest/'data.json'}")
+    else:
+        print(f"no text versions for {key}")
+
+print(f"done: picked {picked} bills")
