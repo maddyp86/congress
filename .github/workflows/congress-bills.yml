@@ -1,4 +1,3 @@
-# .github/workflows/collect-bills.yml
 name: Collect Congress Bills (118–119)
 
 on:
@@ -84,6 +83,12 @@ jobs:
           echo "Bill metadata files (sample):"
           { find data -type f -path "*/bills/*/data.json" | sort | sed 's/^/  /' | head -n 100; } 2>/dev/null || true
 
+      - name: Build manifests
+        run: |
+          set -euo pipefail
+          . env/bin/activate
+          python scripts/build_manifests.py
+      
       - name: Quick Manifest Count
         run: |
           set -euo pipefail
@@ -111,7 +116,7 @@ jobs:
           gsutil ls -b "gs://${GCS_BUCKET}" >/dev/null 2>&1 || gsutil mb -p "${GCP_PROJECT}" "gs://${GCS_BUCKET}"
 
       # --- Upload (nightly / non-destructive) ---
-      - name: Upload Bill metadata to GCS
+      - name: Upload Bills to GCS
         if: ${{ github.event.schedule == '30 9 * * *' || github.event_name == 'workflow_dispatch' }}
         run: |
           set -euo pipefail
@@ -137,7 +142,7 @@ jobs:
           fi
 
       # --- Weekly full-refresh: dry-run then destructive prune ---
-      - name: Upload Bill metadata to GCS 
+      - name: Upload Bills to GCS 
         if: ${{ github.event.schedule == '0 10 * * 0' }}
         run: |
           set -euo pipefail
