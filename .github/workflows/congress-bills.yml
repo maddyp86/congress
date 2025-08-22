@@ -111,7 +111,7 @@ jobs:
           gsutil ls -b "gs://${GCS_BUCKET}" >/dev/null 2>&1 || gsutil mb -p "${GCP_PROJECT}" "gs://${GCS_BUCKET}"
 
       # --- Upload (nightly / non-destructive) ---
-      - name: Upload Bill metadata to GCS (nightly: no-delete)
+      - name: Upload Bill metadata to GCS
         if: ${{ github.event.schedule == '30 9 * * *' || github.event_name == 'workflow_dispatch' }}
         run: |
           set -euo pipefail
@@ -137,7 +137,7 @@ jobs:
           fi
 
       # --- Weekly full-refresh: dry-run then destructive prune ---
-      - name: Upload Bill metadata to GCS (weekly: dry-run then prune)
+      - name: Upload Bill metadata to GCS 
         if: ${{ github.event.schedule == '0 10 * * 0' }}
         run: |
           set -euo pipefail
