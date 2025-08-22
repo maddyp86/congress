@@ -110,20 +110,58 @@ jobs:
           set -euo pipefail
           gsutil ls -b "gs://${GCS_BUCKET}" >/dev/null 2>&1 || gsutil mb -p "${GCP_PROJECT}" "gs://${GCS_BUCKET}"
 
-      - name: Upload Bill metadata to GCS
+      # --- Upload (nightly / non-destructive) ---
+      - name: Upload Bill metadata to GCS (nightly: no-delete)
+        if: ${{ github.event.schedule == '30 9 * * *' || github.event_name == 'workflow_dispatch' }}
         run: |
           set -euo pipefail
           PREFIX="${GCS_PREFIX%/}"
+          TARGET_BASE="gs://${GCS_BUCKET}/${PREFIX:+${PREFIX}/}data"
+
           for C in data/*; do
             [ -d "$C/bills" ] || continue
-            CONS=$(basename "$C")
-            echo "Sync bills for Congress ${CONS} -> gs://${GCS_BUCKET}/${PREFIX}/bills/${CONS}/"
-            # no -d to avoid deleting text-versions that may be uploaded by the billtext workflow
-            gsutil -m rsync -r -d "$C/bills" "gs://${GCS_BUCKET}/${PREFIX}/bills/${CONS}/"
+            CONS="$(basename "$C")"
+            echo "Uploading (no-delete) bills for Congress ${CONS} -> ${TARGET_BASE}/${CONS}/"
+            # sync each bill type directory into <prefix>/data/<congress>/<type>/
+            for TYPE_DIR in "$C"/bills/*; do
+              [ -d "$TYPE_DIR" ] || continue
+              TYPE_NAME="$(basename "$TYPE_DIR")"
+              echo "  rsync (no-delete) $TYPE_DIR -> ${TARGET_BASE}/${CONS}/${TYPE_NAME}/"
+              gsutil -m rsync -r "$TYPE_DIR" "${TARGET_BASE}/${CONS}/${TYPE_NAME}/"
+            done
           done
 
-          echo "Uploading bills manifests -> gs://${GCS_BUCKET}/${PREFIX}/"
-          gsutil cp bills-manifest.json bills-manifest-gcs.json "gs://${GCS_BUCKET}/${PREFIX}/" || true
+          # upload manifests if present
+          if [ -f bills-manifest.json ]; then
+            gsutil cp bills-manifest.json bills-manifest-gcs.json "gs://${GCS_BUCKET}/${PREFIX}/" || true
+          fi
+
+      # --- Weekly full-refresh: dry-run then destructive prune ---
+      - name: Upload Bill metadata to GCS (weekly: dry-run then prune)
+        if: ${{ github.event.schedule == '0 10 * * 0' }}
+        run: |
+          set -euo pipefail
+          PREFIX="${GCS_PREFIX%/}"
+          TARGET_BASE="gs://${GCS_BUCKET}/${PREFIX:+${PREFIX}/}data"
+          TS=$(date -u +"%Y%m%dT%H%M%SZ")
+
+          for C in data/*; do
+            [ -d "$C/bills" ] || continue
+            CONS="$(basename "$C")"
+            echo "Previewing destructive sync for Congress ${CONS}: local=$C/bills -> remote=${TARGET_BASE}/${CONS}/"
+            for TYPE_DIR in "$C"/bills/*; do
+              [ -d "$TYPE_DIR" ] || continue
+              TYPE_NAME="$(basename "$TYPE_DIR")"
+              REMOTE="${TARGET_BASE}/${CONS}/${TYPE_NAME}/"
+              echo "  Dry-run rsync -n $TYPE_DIR -> $REMOTE"
+              gsutil -m rsync -r -n "$TYPE_DIR" "${REMOTE}" || true
+            done
+          done
+
+          # upload manifests if present
+          if [ -f bills-manifest.json ]; then
+            gsutil cp bills-manifest.json bills-manifest-gcs.json "gs://${GCS_BUCKET}/${PREFIX}/" || true
+          fi
 
       - name: Summary
         run: |
