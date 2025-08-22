@@ -128,13 +128,18 @@ jobs:
       - name: Upload Bill Text To Gcloud
         run: |
           set -euo pipefail
+          # normalize prefix (remove trailing slash if present)
           PREFIX="${GCS_PREFIX%/}"
+          # build target path: "<prefix>/billtext" (handles empty prefix safely)
+          TARGET_PREFIX="${PREFIX:+${PREFIX}/}billtext"
+
           if [ ! -d latest_billtext ]; then
             echo "::error::latest_billtext not found (did scripts/latest-bill-text.py run?)"
             exit 1
           fi
-          echo "Sync latest_billtext -> gs://${GCS_BUCKET}/${PREFIX}/billtext/"
-          gsutil -m rsync -r -d latest_billtext "gs://${GCS_BUCKET}/${PREFIX}/billtext"
+
+          echo "Sync latest_billtext -> gs://${GCS_BUCKET}/${TARGET_PREFIX}/"
+          gsutil -m rsync -r -d "latest_billtext" "gs://${GCS_BUCKET}/${TARGET_PREFIX}/"
 
       - name: Summary
         run: |
