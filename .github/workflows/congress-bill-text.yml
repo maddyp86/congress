@@ -83,6 +83,22 @@ jobs:
           set -euo pipefail
           echo "Bill text (text-version data.json) sample:"
           { find data -type f -path "*/bills/*/text-versions/*/data.json" | sort | sed 's/^/  /' | head -n 100; } 2>/dev/null || true
+      
+      - name: Build Latest Bill Text
+        run: |
+          set -euo pipefail
+          . env/bin/activate
+          if [ ! -f scripts/latest-bill-text.py ]; then
+            echo "::error::scripts/latest-bill-text.py not found in repo; expected at scripts/latest-bill-text.py"
+            exit 1
+          fi
+          python scripts/latest-bill-text.py
+
+      - name: Build manifests
+        run: |
+          set -euo pipefail
+          . env/bin/activate
+          python scripts/build_manifests.py
 
       - name: Quick Manifest Count
         run: |
@@ -109,7 +125,7 @@ jobs:
           set -euo pipefail
           gsutil ls -b "gs://${GCS_BUCKET}" >/dev/null 2>&1 || gsutil mb -p "${GCP_PROJECT}" "gs://${GCS_BUCKET}"
 
-      - name: Upload latest bill text JSON (short path)
+      - name: Upload Bill Text To Gcloud
         run: |
           set -euo pipefail
           PREFIX="${GCS_PREFIX%/}"
