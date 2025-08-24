@@ -70,7 +70,7 @@ jobs:
           # build the billtext outputs
           usc-run billtext || { echo "::error:: usc-run billtext failed"; exit 1; }
 
-      - name: Quick debug: counts & samples
+      - name: Quick debug
         run: |
           set -euo pipefail
           echo "Total files under data/: $(find data -type f 2>/dev/null | wc -l || true)"
