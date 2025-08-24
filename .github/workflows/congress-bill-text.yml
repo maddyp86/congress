@@ -1,11 +1,9 @@
-# .github/workflows/collect-billtext.yml
 name: Collect Congress Bill Text (118–119)
 
 on:
   workflow_dispatch: {}
   schedule:
     - cron: "30 9 * * *" # nightly (09:30 UTC)
-    - cron: "0 10 * * 0" # weekly (Sunday 10:00 UTC)
 
 concurrency:
   group: collect-congress-billtext
@@ -25,93 +23,92 @@ jobs:
       GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
 
     steps:
-      - name: Checkout Repo
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
-      - name: Install System Libs
-        run: |
-          set -euo pipefail
-          sudo apt-get update -y
-          sudo apt-get install -y python3-venv jq zip
-
-      - name: Set up Python
+      - name: Setup Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Cache Pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements*.txt', 'pyproject.toml', 'setup.cfg', 'setup.py') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
-      - name: Install Congress Tool
+      - name: Install minimal deps & create venv
         run: |
           set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y jq
           python -m venv env
           . env/bin/activate
           python -m pip install --upgrade pip
           pip install "git+https://github.com/unitedstates/congress.git"
 
-      - name: Verify Required Env
+      - name: Verify required env
         run: |
           set -euo pipefail
           : "${GCP_PROJECT:?Missing required secret GCP_PROJECT}"
           : "${GCS_BUCKET:?Missing required GCS_BUCKET}"
 
-      - name: Ensure Data Dir
+      - name: Ensure data directory
         run: mkdir -p data
 
-      - name: Fetch GovInfo BILLS Text & build billtext
+      - name: Fetch GovInfo BILLS text & build billtext
         run: |
           set -euo pipefail
           . env/bin/activate
           IFS=',' read -ra CONS <<< "${CONGRESSES}"
           for C in "${CONS[@]}"; do
-            C="$(echo "$C" | xargs)"  # trim spaces
+            C="$(echo "$C" | xargs)"
             echo "Fetching BILLS text for Congress $C"
-            usc-run govinfo --collections=BILLS --congress="$C" --store=mods,xml,text --bulkdata=False
-          done
-          usc-run billtext
 
-      - name: Quick Billtext Debug
+            # Pass --bulkdata as a quoted string "False" to follow docs intent
+            # while avoiding CI/parser conversion to boolean that caused the crash.
+            usc-run govinfo --collections=BILLS --congress="$C" --store=mods,xml,text --bulkdata="False" \
+              || { echo "::error:: usc-run govinfo failed for Congress $C"; exit 1; }
+          done
+
+          # build the billtext outputs
+          usc-run billtext || { echo "::error:: usc-run billtext failed"; exit 1; }
+
+      - name: Quick debug: counts & samples
         run: |
           set -euo pipefail
-          echo "Bill text (text-version data.json) sample:"
-          { find data -type f -path "*/bills/*/text-versions/*/data.json" | sort | sed 's/^/  /' | head -n 100; } 2>/dev/null || true
-      
+          echo "Total files under data/: $(find data -type f 2>/dev/null | wc -l || true)"
+          echo "Total data.json under data/: $(find data -type f -name data.json 2>/dev/null | wc -l || true)"
+          echo "Total data.json under text-versions: $(find data -type f -path '*/text-versions/*/data.json' 2>/dev/null | wc -l || true)"
+          echo "Sample data.json (up to 100):"
+          find data -type f -name data.json | sort | sed 's/^/  /' | head -n 100 || true
+
       - name: Build Latest Bill Text
         run: |
           set -euo pipefail
           . env/bin/activate
           if [ ! -f scripts/latest-bill-text.py ]; then
-            echo "::error::scripts/latest-bill-text.py not found in repo; expected at scripts/latest-bill-text.py"
+            echo "::error:: scripts/latest-bill-text.py not found; expected at scripts/latest-bill-text.py"
             exit 1
           fi
           python scripts/latest-bill-text.py
 
-      - name: Build Manifests 
+      - name: Build Manifests
         run: |
           set -euo pipefail
           . env/bin/activate
-
-          if [ -f scripts/build_manifests.py ]; then
-            # Use repo manifest script if present (it should prefer latest_billtext ideally)
-            python scripts/build_manifests.py
-            exit 0
+          if [ ! -f scripts/build_manifests.py ]; then
+            echo "::error:: scripts/build_manifests.py not found; expected at scripts/build_manifests.py"
+            exit 1
           fi
+          python scripts/build_manifests.py
 
-      - name: Debug Latest Bill Text
+      - name: Debug latest_billtext
         run: |
           set -euo pipefail
           echo "latest_billtext exists?"; [ -d latest_billtext ] && echo "yes" || echo "no"
-          echo "Sample latest_billtext files:"; find latest_billtext -type f -name data.json | sed -n '1,200p' || true
+          echo "Count latest_billtext data.json files:"
+          find latest_billtext -type f -name data.json | wc -l || true
+          echo "Sample latest_billtext files (up to 200):"
+          find latest_billtext -type f -name data.json | sed -n '1,200p' || true
 
-      - name: Quick Manifest Count
+      - name: Quick manifest count
         run: |
           set -euo pipefail
           if [ -f billtext-manifest.json ]; then
@@ -120,51 +117,42 @@ jobs:
             echo "BillText manifest not found"
           fi
 
-      # NOTE: We no longer mirror the raw bills/ tree, so we don't upload package.zip/html/pdf/xml.
-      # Instead, we only publish the curated latest_billtext JSONs to a short path: <prefix>/billtext/
-
-      # --- GCP auth + upload (BILL TEXT ONLY) ---
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
-      - name: Setup Gcloud
+      - name: Setup gcloud (gsutil)
         uses: google-github-actions/setup-gcloud@v2
         with:
           project_id: ${{ env.GCP_PROJECT }}
           version: '>= 472.0.0'
 
-      - name: Ensure Bucket Exists
+      - name: Ensure bucket exists
         run: |
           set -euo pipefail
           gsutil ls -b "gs://${GCS_BUCKET}" >/dev/null 2>&1 || gsutil mb -p "${GCP_PROJECT}" "gs://${GCS_BUCKET}"
-          
-      # Non-destructive (nightly/manual)
+
       - name: Upload Bill Text to GCS (non-destructive)
-        if: ${{ github.event_name == 'workflow_dispatch' || github.event.schedule == '30 9 * * *' }}
         run: |
           set -euo pipefail
           PREFIX="${GCS_PREFIX%/}"
           TARGET_PREFIX="${PREFIX:+${PREFIX}/}data"
-          [ -d latest_billtext ] || { echo "::error:: latest_billtext not found"; exit 1; }
+          if [ ! -d latest_billtext ]; then
+            echo "::error:: latest_billtext not found; aborting upload"
+            exit 1
+          fi
+
+          COUNT=$(find latest_billtext -type f -name data.json | wc -l || true)
+          echo "latest_billtext data.json count: ${COUNT}"
+          # Safety threshold: avoid accidental uploads when latest_billtext is empty or tiny.
+          if [ "${COUNT}" -lt 10 ]; then
+            echo "::error:: latest_billtext appears too small (${COUNT} files). Aborting upload to avoid accidental sync issues."
+            exit 1
+          fi
+
           echo "Non-destructive rsync: latest_billtext -> gs://${GCS_BUCKET}/${TARGET_PREFIX}/"
           gsutil -m rsync -r "latest_billtext" "gs://${GCS_BUCKET}/${TARGET_PREFIX}/"
-
-      # Weekly full-refresh: dry-run then prune
-      - name: Upload Bill Text to GCS (desctructive)
-        if: ${{ github.event.schedule == '0 10 * * 0' }}
-        run: |
-          set -euo pipefail
-          PREFIX="${GCS_PREFIX%/}"
-          TARGET_PREFIX="${PREFIX:+${PREFIX}/}data"
-          [ -d latest_billtext ] || { echo "::error:: latest_billtext not found"; exit 1; }
-      
-          echo "Weekly dry-run (no changes yet):"
-          gsutil -m rsync -r -n "latest_billtext" "gs://${GCS_BUCKET}/${TARGET_PREFIX}/" || true
-      
-          echo "Applying destructive rsync (will remove remote objects not present locally):"
-          gsutil -m rsync -r -d "latest_billtext" "gs://${GCS_BUCKET}/${TARGET_PREFIX}/"
 
       - name: Summary
         run: |
