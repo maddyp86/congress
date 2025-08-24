@@ -1,4 +1,4 @@
-name: Collect Congress Bill Text (latest -> GCS)
+name: Collect Congress Bill Text (118-119)
 
 on:
   workflow_dispatch: {}
@@ -130,7 +130,7 @@ jobs:
           set -euo pipefail
           gsutil ls -b "gs://${GCS_BUCKET}" >/dev/null 2>&1 || gsutil mb -p "${GCP_PROJECT}" "gs://${GCS_BUCKET}"
 
-      - name: Upload curated latest_billtext JSONs to GCS
+      - name: Upload Bill Text to GCS
         run: |
           set -euo pipefail
           PREFIX="${GCS_PREFIX%/}"
