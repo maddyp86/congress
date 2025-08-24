@@ -94,16 +94,31 @@ jobs:
           fi
           python scripts/latest-bill-text.py
 
-      - name: Build manifests
+      - name: Build Manifests 
         run: |
           set -euo pipefail
           . env/bin/activate
-          python scripts/build_manifests.py
+
+          if [ -f scripts/build_manifests.py ]; then
+            # Use repo manifest script if present (it should prefer latest_billtext ideally)
+            python scripts/build_manifests.py
+            exit 0
+          fi
+
+      - name: Debug Latest Bill Text
+        run: |
+          set -euo pipefail
+          echo "latest_billtext exists?"; [ -d latest_billtext ] && echo "yes" || echo "no"
+          echo "Sample latest_billtext files:"; find latest_billtext -type f -name data.json | sed -n '1,200p' || true
 
       - name: Quick Manifest Count
         run: |
           set -euo pipefail
-          echo "BillText files (from latest_billtext): $(jq '.files | length' billtext-manifest.json || echo 0)"
+          if [ -f billtext-manifest.json ]; then
+            echo "BillText files (manifest): $(jq '.files | length' billtext-manifest.json 2>/dev/null || echo 0)"
+          else
+            echo "BillText manifest not found"
+          fi
 
       # NOTE: We no longer mirror the raw bills/ tree, so we don't upload package.zip/html/pdf/xml.
       # Instead, we only publish the curated latest_billtext JSONs to a short path: <prefix>/billtext/
@@ -124,21 +139,31 @@ jobs:
         run: |
           set -euo pipefail
           gsutil ls -b "gs://${GCS_BUCKET}" >/dev/null 2>&1 || gsutil mb -p "${GCP_PROJECT}" "gs://${GCS_BUCKET}"
-
-      - name: Upload Bill Text To Gcloud
+          
+      # Non-destructive (nightly/manual)
+      - name: Upload Bill Text to GCS (non-destructive)
+        if: ${{ github.event_name == 'workflow_dispatch' || github.event.schedule == '30 9 * * *' }}
         run: |
           set -euo pipefail
-          # normalize prefix (remove trailing slash if present)
           PREFIX="${GCS_PREFIX%/}"
-          # build target path: "<prefix>/billtext" (handles empty prefix safely)
-          TARGET_PREFIX="${PREFIX:+${PREFIX}/}billtext"
+          TARGET_PREFIX="${PREFIX:+${PREFIX}/}data"
+          [ -d latest_billtext ] || { echo "::error:: latest_billtext not found"; exit 1; }
+          echo "Non-destructive rsync: latest_billtext -> gs://${GCS_BUCKET}/${TARGET_PREFIX}/"
+          gsutil -m rsync -r "latest_billtext" "gs://${GCS_BUCKET}/${TARGET_PREFIX}/"
 
-          if [ ! -d latest_billtext ]; then
-            echo "::error::latest_billtext not found (did scripts/latest-bill-text.py run?)"
-            exit 1
-          fi
-
-          echo "Sync latest_billtext -> gs://${GCS_BUCKET}/${TARGET_PREFIX}/"
+      # Weekly full-refresh: dry-run then prune
+      - name: Upload Bill Text to GCS (desctructive)
+        if: ${{ github.event.schedule == '0 10 * * 0' }}
+        run: |
+          set -euo pipefail
+          PREFIX="${GCS_PREFIX%/}"
+          TARGET_PREFIX="${PREFIX:+${PREFIX}/}data"
+          [ -d latest_billtext ] || { echo "::error:: latest_billtext not found"; exit 1; }
+      
+          echo "Weekly dry-run (no changes yet):"
+          gsutil -m rsync -r -n "latest_billtext" "gs://${GCS_BUCKET}/${TARGET_PREFIX}/" || true
+      
+          echo "Applying destructive rsync (will remove remote objects not present locally):"
           gsutil -m rsync -r -d "latest_billtext" "gs://${GCS_BUCKET}/${TARGET_PREFIX}/"
 
       - name: Summary
