@@ -21,30 +21,51 @@ env:
 
 jobs:
   collect_billtext:
+    # parallelize per-congress to reduce wall-clock time
     runs-on: ubuntu-latest
-    steps:
+    timeout-minutes: 420            # 7 hours per job; adjust if needed
+    strategy:
+      fail-fast: false
+      matrix:
+        # split the CONGRESSES env into a stable list here; change if you want
+        congress: [118, 119]
 
+    steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/pyproject.toml', '**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
       - name: Install system packages
         run: |
           set -euo pipefail
           sudo apt-get update -y
-          sudo apt-get install -y python3-venv jq zip
+          # install python venv, unzip, jq, zip
+          sudo apt-get install -y python3-venv jq zip unzip
 
-      - name: Setup Python venv and install usc-run
+      - name: Setup Python venv
+        env:
+          PIP_CACHE_DIR: ${{ runner.temp }}/pip-cache
         run: |
           set -euo pipefail
           python -V
           python -m pip install --upgrade pip
           python -m venv env
-          ./env/bin/python -m pip install --upgrade pip
+          . env/bin/activate
+          python -m pip install --upgrade pip
           # install the official CLI (usc-run) from unitedstates/congress
-          ./env/bin/python -m pip install "git+https://github.com/unitedstates/congress.git"
-          # Export the interpreter path for use in later steps
+          python -m pip install "git+https://github.com/unitedstates/congress.git"
+          # install local repository in editable mode so local modules (e.g., billtext) are importable
+          python -m pip install -e .
+          # Export interpreter path and unbuffered output for later steps
           echo "PYTHON=./env/bin/python" >> $GITHUB_ENV
           echo "PYTHONUNBUFFERED=1" >> $GITHUB_ENV
 
@@ -59,15 +80,11 @@ jobs:
         run: |
           set -euo pipefail
           USC="./env/bin/usc-run"
-          IFS=',' read -ra CONS <<< "${CONGRESSES}"
-          for C in "${CONS[@]}"; do
-            C="${C//[[:space:]]/}"
-            [ -z "$C" ] && continue
-            echo "=== Fetching BILLS text for Congress ${C} ==="
-            # follow docs: include text; avoid the separate BILLS bulkdata collection
-            $USC govinfo --collections=BILLS --congress="${C}" --store=mods,xml,text --bulkdata="False" \
-              || { echo "::error:: usc-run govinfo failed for ${C}"; exit 1; }
-          done
+          C="${{ matrix.congress }}"
+          echo "=== Fetching BILLS text for Congress ${C} ==="
+          # follow docs: include text; avoid the separate BILLS bulkdata collection
+          $USC govinfo --collections=BILLS --congress="${C}" --store=mods,xml,text --bulkdata="False" \
+            || { echo "::error:: usc-run govinfo failed for ${C}"; exit 1; }
 
           echo "=== Running billtext processor (usc-run billtext) ==="
           $USC billtext || { echo "::error:: usc-run billtext failed"; exit 1; }
@@ -75,24 +92,27 @@ jobs:
       - name: Unzip billtext packages
         run: |
           set -euo pipefail
-
-          echo "== Ensure unzip is available =="
-          sudo apt-get update -y
-          sudo apt-get install -y unzip
-          
           echo "Unzipping any package.zip files under data/ ..."
+          found=0
           find data -type f -name 'package.zip' -print0 | while IFS= read -r -d '' zipfile; do
+            found=1
             dir="$(dirname "$zipfile")"
             echo "Extracting: $zipfile -> $dir"
-            # unzip -q will overwrite by default; -o ensures overwriting if present
-            unzip -o "$zipfile" -d "$dir"
+            if unzip -o "$zipfile" -d "$dir"; then
+              echo "OK: $zipfile extracted"
+            else
+              echo "::warning:: Failed to extract $zipfile — continuing to next file"
+            fi
           done
+          if [ "$found" -eq 0 ]; then
+            echo "No package.zip files found (this can be okay if upstream writes files directly)."
+          fi
 
           echo "Verification: counts and sample paths"
-          echo "data.json count:"
+          echo "data.json count under data/:"
           find data -type f -name data.json | wc -l
-          echo "Some sample files:"
-          find data -type f -path "*/bills/*/*/text-versions/*/*" | sed -n '1,30p'
+          echo "Some sample files under text-versions:"
+          find data -type f -path "*/bills/*/*/text-versions/*/*" | sed -n '1,30p' || true
 
       - name: Quick Debug
         run: |
@@ -105,7 +125,6 @@ jobs:
         run: |
           set -euo pipefail
           echo "Running latest-bill-text via $PYTHON"
-          # script MUST return non-zero if it picked 0 bills (safety)
           $PYTHON -u scripts/latest-bill-text.py
 
       - name: Debug Bill Text
@@ -156,24 +175,25 @@ jobs:
         run: |
           set -euo pipefail
           PREFIX="${GCS_PREFIX%/}"
-          TARGET_PREFIX="${PREFIX:+${PREFIX}/}data"
+          CONGRESS="${{ matrix.congress }}"
+          TARGET_PREFIX="${PREFIX:+${PREFIX}/}data/${CONGRESS}"
           echo "Uploading latest_billtext -> gs://${GCS_BUCKET}/${TARGET_PREFIX}/ (non-destructive rsync)"
-          # we already checked manifest contains files; use rsync to copy whole tree non-destructively
           gsutil -m rsync -r "latest_billtext" "gs://${GCS_BUCKET}/${TARGET_PREFIX}/"
 
-      - name: Upload manifests to GCS
+      - name: Upload manifest to GCS
         run: |
           set -euo pipefail
           PREFIX="${GCS_PREFIX%/}"
-          echo "Uploading manifest files to gs://${GCS_BUCKET}/${PREFIX}/ (non-destructive, -n to avoid overwrites)"
-          # -n prevents overwriting existing identical objects; manifest updates still copy if not present
-          gsutil -m cp -n billtext-manifest.json billtext-manifest-gcs.json "gs://${GCS_BUCKET}/${PREFIX}/" || true
+          CONGRESS="${{ matrix.congress }}"
+          GS_PREFIX="${PREFIX:+${PREFIX}/}manifests/${CONGRESS}"
+          echo "Uploading manifest file to gs://${GCS_BUCKET}/${GS_PREFIX}/"
+          gsutil -m cp -n billtext-manifest.json "gs://${GCS_BUCKET}/${GS_PREFIX}/" || { echo "::warning:: manifest upload may have failed"; }
 
       - name: Summary
         run: |
           set -euo pipefail
           COUNT_TEXT=$(find latest_billtext -type f -name data.json 2>/dev/null | wc -l || echo 0)
-          echo "Completed billtext run."
+          echo "Completed billtext run for Congress ${matrix.congress}."
           echo "latest_billtext JSON count: ${COUNT_TEXT}"
           echo "Bucket: ${GCS_BUCKET}"
           echo "Prefix: ${GCS_PREFIX}"
