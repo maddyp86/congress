@@ -21,37 +21,34 @@ env:
 
 jobs:
   collect_billtext:
-    # parallelize per-congress to reduce wall-clock time
     runs-on: ubuntu-latest
-    timeout-minutes: 420            # 7 hours per job; adjust if needed
-    strategy:
-      fail-fast: false
-      matrix:
-        # split the CONGRESSES env into a stable list here; change if you want
-        congress: [118, 119]
 
     steps:
-      - name: Checkout repository
+      - name: Checkout Repo
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
 
       - name: Cache pip
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/pyproject.toml', '**/requirements.txt') }}
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/pyproject.toml', '**/requirements*.txt', '**/setup.cfg', '**/setup.py') }}
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      - name: Install system packages
+      - name: Install System Libs
         run: |
           set -euo pipefail
           sudo apt-get update -y
-          # install python venv, unzip, jq, zip
           sudo apt-get install -y python3-venv jq zip unzip
 
-      - name: Setup Python venv
+      - name: Create venv & install Congress tool + local package
         env:
           PIP_CACHE_DIR: ${{ runner.temp }}/pip-cache
         run: |
@@ -65,29 +62,34 @@ jobs:
           python -m pip install "git+https://github.com/unitedstates/congress.git"
           # install local repository in editable mode so local modules (e.g., billtext) are importable
           python -m pip install -e .
-          # Export interpreter path and unbuffered output for later steps
+          # export interpreter path for later steps
           echo "PYTHON=./env/bin/python" >> $GITHUB_ENV
           echo "PYTHONUNBUFFERED=1" >> $GITHUB_ENV
 
-      - name: Ensure clean workspace dirs
+      - name: Verify required env
         run: |
           set -euo pipefail
-          mkdir -p data
-          # we intentionally remove old latest_billtext so the script controls updates
-          rm -rf latest_billtext || true
+          : "${GCP_PROJECT:?Missing required secret GCP_PROJECT}"
+          : "${GCS_BUCKET:?Missing required GCS_BUCKET}"
+
+      - name: Ensure data dir
+        run: mkdir -p data
 
       - name: Fetch GOVInfo Bill Text
         run: |
           set -euo pipefail
-          USC="./env/bin/usc-run"
-          C="${{ matrix.congress }}"
-          echo "=== Fetching BILLS text for Congress ${C} ==="
-          # follow docs: include text; avoid the separate BILLS bulkdata collection
-          $USC govinfo --collections=BILLS --congress="${C}" --store=mods,xml,text --bulkdata="False" \
-            || { echo "::error:: usc-run govinfo failed for ${C}"; exit 1; }
-
-          echo "=== Running billtext processor (usc-run billtext) ==="
-          $USC billtext || { echo "::error:: usc-run billtext failed"; exit 1; }
+          . env/bin/activate
+          IFS=',' read -ra CONS <<< "${CONGRESSES}"
+          for C in "${CONS[@]}"; do
+            C="$(echo "$C" | xargs)"
+            echo "Fetching BILLS text for Congress $C"
+            # Pass --bulkdata as a quoted string "False" to follow docs intent
+            # while avoiding CI/parser conversion to boolean that caused the crash.
+            usc-run govinfo --collections=BILLS --congress="$C" --store=mods,xml,text --bulkdata="False" \
+              || { echo "::error:: usc-run govinfo failed for Congress $C"; exit 1; }
+          done
+          # build the billtext outputs
+          usc-run billtext || { echo "::error:: usc-run billtext failed"; exit 1; }
 
       - name: Unzip billtext packages
         run: |
@@ -175,8 +177,7 @@ jobs:
         run: |
           set -euo pipefail
           PREFIX="${GCS_PREFIX%/}"
-          CONGRESS="${{ matrix.congress }}"
-          TARGET_PREFIX="${PREFIX:+${PREFIX}/}data/${CONGRESS}"
+          TARGET_PREFIX="${PREFIX:+${PREFIX}/}data"
           echo "Uploading latest_billtext -> gs://${GCS_BUCKET}/${TARGET_PREFIX}/ (non-destructive rsync)"
           gsutil -m rsync -r "latest_billtext" "gs://${GCS_BUCKET}/${TARGET_PREFIX}/"
 
@@ -184,8 +185,7 @@ jobs:
         run: |
           set -euo pipefail
           PREFIX="${GCS_PREFIX%/}"
-          CONGRESS="${{ matrix.congress }}"
-          GS_PREFIX="${PREFIX:+${PREFIX}/}manifests/${CONGRESS}"
+          GS_PREFIX="${PREFIX:+${PREFIX}/}manifests"
           echo "Uploading manifest file to gs://${GCS_BUCKET}/${GS_PREFIX}/"
           gsutil -m cp -n billtext-manifest.json "gs://${GCS_BUCKET}/${GS_PREFIX}/" || { echo "::warning:: manifest upload may have failed"; }
 
@@ -193,7 +193,7 @@ jobs:
         run: |
           set -euo pipefail
           COUNT_TEXT=$(find latest_billtext -type f -name data.json 2>/dev/null | wc -l || echo 0)
-          echo "Completed billtext run for Congress ${matrix.congress}."
+          echo "Completed billtext run."
           echo "latest_billtext JSON count: ${COUNT_TEXT}"
           echo "Bucket: ${GCS_BUCKET}"
           echo "Prefix: ${GCS_PREFIX}"
