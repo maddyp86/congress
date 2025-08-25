@@ -72,6 +72,28 @@ jobs:
           echo "=== Running billtext processor (usc-run billtext) ==="
           $USC billtext || { echo "::error:: usc-run billtext failed"; exit 1; }
 
+      - name: Unzip billtext packages
+        run: |
+          set -euo pipefail
+
+          echo "== Ensure unzip is available =="
+          sudo apt-get update -y
+          sudo apt-get install -y unzip
+          
+          echo "Unzipping any package.zip files under data/ ..."
+          find data -type f -name 'package.zip' -print0 | while IFS= read -r -d '' zipfile; do
+            dir="$(dirname "$zipfile")"
+            echo "Extracting: $zipfile -> $dir"
+            # unzip -q will overwrite by default; -o ensures overwriting if present
+            unzip -o "$zipfile" -d "$dir"
+          done
+
+          echo "Verification: counts and sample paths"
+          echo "data.json count:"
+          find data -type f -name data.json | wc -l
+          echo "Some sample files:"
+          find data -type f -path "*/bills/*/*/text-versions/*/*" | sed -n '1,30p'
+
       - name: Quick Debug
         run: |
           set -euo pipefail
