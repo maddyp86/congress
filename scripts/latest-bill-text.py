@@ -3,7 +3,6 @@ import pathlib
 import shutil
 import sys
 import tempfile
-import zipfile
 import xml.etree.ElementTree as ET
 import re
 from datetime import datetime, timezone
@@ -73,6 +72,23 @@ def find_date_in_mods(root):
 
 
 def find_identifier_in_mods(root):
+    # prefer type='local' or 'bill', else first non-empty identifier
+    for el in root.iter():
+        if strip_ns(el.tag).lower() == "identifier":
+            attrs = {k.lower(): v for k, v in el.attrib.items()}
+            txt = (el.text or "").strip()
+            if attrs.get("type", "").lower() in ("local", "bill") and txt:
+                return txt
+    # second pass: any canonical-looking identifier
+    human_re = re.compile(
+        r'(?i)^(?:hr|s|hres|sres|hjres|sjres|hconres|sconres)[0-9]+-[0-9]{1,4}-[a-z]{1,10}$'
+    )
+    for el in root.iter():
+        if strip_ns(el.tag).lower() == "identifier":
+            txt = (el.text or "").strip()
+            if txt and human_re.search(txt):
+                return txt
+    # fallback: first non-empty identifier
     for el in root.iter():
         if strip_ns(el.tag).lower() == "identifier":
             txt = (el.text or "").strip()
@@ -126,9 +142,6 @@ def extract_urls_from_mods(root):
     return urls
 
 
-# -------------------------
-# Read/parse mods.xml from file or zip
-# -------------------------
 def parse_mods_file(path: pathlib.Path):
     try:
         root = ET.parse(str(path)).getroot()
@@ -137,21 +150,57 @@ def parse_mods_file(path: pathlib.Path):
         return None
 
 
-def parse_mods_from_zip(zip_path: pathlib.Path):
+# -------------------------
+# New: synthesize bill_id from path (always used)
+# -------------------------
+def synthesize_bill_id_from_path(tv_path: pathlib.Path) -> str:
+    """
+    Given a text-version dir path like:
+      data/118/bills/hr/hr85/text-versions/ih
+    produce canonical bill_id: 'hr85-118' -> normalized to 'hr85-118' (lowercase).
+    Returns the string or raises ValueError if unable to synthesize.
+    """
+    parts = list(tv_path.parts)
+    if "bills" not in parts:
+        raise ValueError(f"Cannot synthesize bill_id: 'bills' segment not in path {tv_path}")
     try:
-        with zipfile.ZipFile(str(zip_path), "r") as z:
-            for member in z.namelist():
-                if member.lower().endswith("mods.xml"):
-                    try:
-                        with z.open(member) as mf:
-                            data_bytes = mf.read()
-                            root = ET.fromstring(data_bytes)
-                            return root
-                    except Exception:
-                        continue
-    except Exception:
-        pass
-    return None
+        bi = parts.index("bills")
+        # Expect: .../<congress>/bills/<bill_type>/<bill_dir>/text-versions/<version>
+        if bi < 1 or len(parts) <= bi + 2:
+            raise ValueError(f"Path too short to synthesize bill_id: {tv_path}")
+        congress_raw = parts[bi - 1]
+        bill_type = parts[bi + 1].lower()  # e.g., 'hr' or 's'
+        bill_dir = parts[bi + 2].lower()   # e.g., 'hr1237' or 'hr85'
+    except Exception as e:
+        raise ValueError(f"Failed to parse path for bill_id: {tv_path}: {e}")
+
+    # Prefer pattern like 'hr1237' (alpha prefix + digits)
+    m = re.match(r'^([a-z]+)(\d+)', bill_dir)
+    if m:
+        bt = m.group(1)
+        num = str(int(m.group(2)))  # strip leading zeros
+        cong = str(int(congress_raw))
+        return f"{bt}{num}-{cong}".lower()
+
+    # Otherwise, take first run of digits anywhere in bill_dir
+    m2 = re.search(r'(\d+)', bill_dir)
+    if m2:
+        num = str(int(m2.group(1)))
+        bt = bill_type or 'hr'
+        cong = str(int(congress_raw))
+        return f"{bt}{num}-{cong}".lower()
+
+    # Fallback: scan a few following path components for digits
+    for extra in parts[bi + 2:bi + 6]:
+        m3 = re.search(r'(\d+)', extra)
+        if m3:
+            num = str(int(m3.group(1)))
+            bt = bill_type or 'hr'
+            cong = str(int(congress_raw))
+            return f"{bt}{num}-{cong}".lower()
+
+    # If all else fails, raise so caller can log and handle
+    raise ValueError(f"Unable to synthesize bill_id from path: {tv_path}")
 
 
 # -------------------------
@@ -180,16 +229,10 @@ def ensure_data_jsons():
                         mods_root = parse_mods_file(cand)
                         if mods_root is not None:
                             break
-        # recursive search
+        # recursive search for any mods.xml under tv (workflow already unzipped)
         if mods_root is None:
             for cand in tv.rglob("mods.xml"):
                 mods_root = parse_mods_file(cand)
-                if mods_root is not None:
-                    break
-        # check inside package.zip
-        if mods_root is None:
-            for cand in tv.rglob("package.zip"):
-                mods_root = parse_mods_from_zip(cand)
                 if mods_root is not None:
                     break
 
@@ -208,12 +251,22 @@ def ensure_data_jsons():
             except Exception:
                 issued = None
 
+        # synthesize bill_id from path (always prefer path-based deterministic id)
+        try:
+            bill_id = synthesize_bill_id_from_path(tv)
+        except Exception as e:
+            bill_id = None
+            print(f"WARNING: {e}")
+
         data = {}
         if issued:
             data["issued_on"] = str(issued)
         data["version_code"] = tv.name
         if version_id:
             data["bill_version_id"] = version_id
+        if bill_id:
+            data["bill_id"] = bill_id
+            data["bill_id_source"] = "path"
         if urls_map:
             data["urls"] = urls_map
 
@@ -282,7 +335,7 @@ try:
         else:
             print(f"no valid candidate for {key}")
 
-    print(f"done: picked {picked} bills (skipped {skipped} files)")
+    print(f"done: picked {picked} bills (skipped {skipped})")
     if picked == 0:
         print("ERROR: picked 0 bills — not updating latest_billtext. Exiting with code 2.", flush=True)
         sys.exit(2)
