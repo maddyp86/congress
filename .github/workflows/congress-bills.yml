@@ -1,4 +1,4 @@
-name: Collect Congress Bills (118–119)
+name: Collect Congress Bills (119)
 
 on:
   workflow_dispatch: {}
@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      CONGRESSES: ${{ secrets.CONGRESSES || '118,119' }}
+      CONGRESSES: ${{ secrets.CONGRESSES || '119' }}
       GCS_BUCKET: ${{ secrets.GCS_BUCKET || 'congress-legislative-data' }}
       GCS_PREFIX: ${{ secrets.GCS_PREFIX || 'congress-bill-data' }}
       GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
