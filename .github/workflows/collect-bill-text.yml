@@ -68,7 +68,7 @@ jobs:
             -P data/119 \
             https://www.govinfo.gov/bulkdata/BILLS/119/
           echo "Sample downloaded files:"
-          find data/119 -type f | head -n 30
+          find data/119 -type f -print | head -n 30 || true
 
       - name: Normalize bulkdata into bills/ tree
         run: |
