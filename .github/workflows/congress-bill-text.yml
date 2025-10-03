@@ -20,7 +20,7 @@ env:
 
 jobs:
   # ----------------------
-  # Matrix: Fetch raw data per bill type
+  # Matrix: Fetch raw bill data by type
   # ----------------------
   fetch_billtext:
     runs-on: ubuntu-latest
@@ -41,7 +41,7 @@ jobs:
       - name: Install System Libs
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y python3-venv jq zip unzip
+          sudo apt-get install -y python3-venv jq zip unzip rsync
 
       - name: Create venv & install Congress tool
         run: |
@@ -53,7 +53,27 @@ jobs:
           echo "PYTHON=./env/bin/python" >> $GITHUB_ENV
           echo "PYTHONUNBUFFERED=1" >> $GITHUB_ENV
 
-      - name: Fetch GOVInfo Bill Text by type
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.GCP_PROJECT }}
+          version: '>= 472.0.0'
+
+      - name: Restore previous data from GCS
+        run: |
+          set -euo pipefail
+          mkdir -p data/119/bills/${{ matrix.bill_type }}
+          PREFIX="${GCS_PREFIX%/}"
+          TARGET_PREFIX="${PREFIX:+${PREFIX}/}data/119/bills/${{ matrix.bill_type }}"
+          echo "Syncing GCS -> local data for Congress 119, type ${{ matrix.bill_type }}"
+          gsutil -m rsync -r "gs://${GCS_BUCKET}/${TARGET_PREFIX}" "data/119/bills/${{ matrix.bill_type }}" || true
+
+      - name: Fetch GOVInfo Bill Text by type (incremental)
         run: |
           set -euo pipefail
           . env/bin/activate
@@ -69,12 +89,13 @@ jobs:
               || { echo "::error:: usc-run govinfo failed for Congress $C ${{ matrix.bill_type }}"; exit 1; }
           done
 
-      # Upload raw `data/` from this job
-      - name: Upload raw data artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: billtext-${{ matrix.bill_type }}
-          path: data/
+      - name: Upload updated data back to GCS
+        run: |
+          set -euo pipefail
+          PREFIX="${GCS_PREFIX%/}"
+          TARGET_PREFIX="${PREFIX:+${PREFIX}/}data/119/bills/${{ matrix.bill_type }}"
+          echo "Syncing local -> GCS for ${{ matrix.bill_type }}"
+          gsutil -m rsync -r "data/119/bills/${{ matrix.bill_type }}" "gs://${GCS_BUCKET}/${TARGET_PREFIX}"
 
   # ----------------------
   # Aggregation Job
@@ -87,24 +108,60 @@ jobs:
       - name: Checkout Repo
         uses: actions/checkout@v4
 
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: data-raw
-
-      - name: Merge artifacts into data/
+      - name: Install System Libs
         run: |
+          sudo apt-get update -y
+          sudo apt-get install -y python3-venv jq zip unzip rsync
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.GCP_PROJECT }}
+          version: '>= 472.0.0'
+
+      - name: Restore full data tree from GCS
+        run: |
+          set -euo pipefail
           mkdir -p data
-          # Merge all bill types under a single "data/" tree
-          for d in data-raw/*; do
-            rsync -a "$d/" data/
+          PREFIX="${GCS_PREFIX%/}"
+          TARGET_PREFIX="${PREFIX:+${PREFIX}/}data/119"
+          echo "Syncing GCS -> local full data for Congress 119..."
+          gsutil -m rsync -r "gs://${GCS_BUCKET}/${TARGET_PREFIX}" "data/119"
+
+      - name: Unzip billtext packages
+        run: |
+          set -euo pipefail
+          echo "Unzipping any package.zip files under data/ ..."
+          found=0
+          find data -type f -name 'package.zip' -print0 | while IFS= read -r -d '' zipfile; do
+            found=1
+            dir="$(dirname "$zipfile")"
+            echo "Extracting: $zipfile -> $dir"
+            if unzip -o "$zipfile" -d "$dir"; then
+              echo "OK: $zipfile extracted"
+            else
+              echo "::warning:: Failed to extract $zipfile — continuing to next file"
+            fi
           done
-          echo "Merged data tree:"
-          find data -maxdepth 4 | head -n 50
+          if [ "$found" -eq 0 ]; then
+            echo "No package.zip files found (this can be okay if upstream writes files directly)."
+          fi
+
+      - name: Quick Debug
+        run: |
+          echo "Total data.json files under data/: $(find data -type f -name data.json | wc -l || true)"
+          echo "Sample text-version data.json (data/*/bills/*/*/text-versions/*/data.json):"
+          find data -type f -path "data/*/bills/*/*/text-versions/*/data.json" | sort | sed -n '1,100p' || true
 
       - name: Run usc-run billtext
         run: |
-          . env/bin/activate || python -m venv env && . env/bin/activate
+          python -m venv env
+          . env/bin/activate
           python -m pip install --upgrade pip
           python -m pip install "git+https://github.com/unitedstates/congress.git"
           python -m pip install -e .
@@ -115,16 +172,49 @@ jobs:
           . env/bin/activate
           $PYTHON -u scripts/latest-bill-text.py
 
+      - name: Debug Bill Text
+        run: |
+          echo "latest_billtext exists?"; [ -d latest_billtext ] && echo "yes" || echo "no"
+          echo "latest_billtext data.json count:"; find latest_billtext -type f -name data.json | wc -l || true
+          echo "Sample latest_billtext files (up to 200):"
+          find latest_billtext -type f -name data.json | sort | sed -n '1,200p' || true
+
       - name: Build manifests
         run: |
           . env/bin/activate
           $PYTHON -u scripts/build_manifests.py
 
-      - name: Upload to GCS
+      - name: Manifest sanity checks
         run: |
-          set -euo pipefail
+          if [ ! -f billtext-manifest.json ]; then
+            echo "::error:: billtext-manifest.json not found; aborting"
+            exit 1
+          fi
+          BILLCOUNT=$(jq '.files | length' billtext-manifest.json 2>/dev/null || echo 0)
+          echo "billtext-manifest.json contains ${BILLCOUNT} entries"
+          if [ "${BILLCOUNT}" -lt 1 ]; then
+            echo "::error:: billtext-manifest.json is empty; aborting upload (safety)"
+            exit 1
+          fi
+
+      - name: Upload Bill Text to GCS
+        run: |
           PREFIX="${GCS_PREFIX%/}"
           TARGET_PREFIX="${PREFIX:+${PREFIX}/}data"
+          echo "Uploading latest_billtext -> gs://${GCS_BUCKET}/${TARGET_PREFIX}/"
           gsutil -m rsync -r "latest_billtext" "gs://${GCS_BUCKET}/${TARGET_PREFIX}/"
+
+      - name: Upload manifest to GCS
+        run: |
+          PREFIX="${GCS_PREFIX%/}"
           GS_PREFIX="${PREFIX:+${PREFIX}/}manifests"
+          echo "Uploading manifest file to gs://${GCS_BUCKET}/${GS_PREFIX}/"
           gsutil -m cp -n billtext-manifest.json "gs://${GCS_BUCKET}/${GS_PREFIX}/" || true
+
+      - name: Summary
+        run: |
+          COUNT_TEXT=$(find latest_billtext -type f -name data.json 2>/dev/null | wc -l || echo 0)
+          echo "Completed billtext aggregation."
+          echo "latest_billtext JSON count: ${COUNT_TEXT}"
+          echo "Bucket: ${GCS_BUCKET}"
+          echo "Prefix: ${GCS_PREFIX}"
