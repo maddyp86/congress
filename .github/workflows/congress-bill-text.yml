@@ -85,8 +85,8 @@ jobs:
             echo "Fetching BILLS text for Congress $C"
             # Pass --bulkdata as a quoted string "False" to follow docs intent
             # while avoiding CI/parser conversion to boolean that caused the crash.
-            usc-run govinfo --collections=BILLS --congress="$C" --store=mods,xml,text --bulkdata="False" --sleep=0.5 --workers=1
-            || { echo "::error:: usc-run govinfo failed for Congress $C"; exit 1; }
+            usc-run govinfo --collections=BILLS --congress="$C" --store=mods,xml,text --bulkdata="False" --sleep=0.5 --workers=1 \
+              || { echo "::error:: usc-run govinfo failed for Congress $C"; exit 1; }
           done
           # build the billtext outputs
           usc-run billtext || { echo "::error:: usc-run billtext failed"; exit 1; }
