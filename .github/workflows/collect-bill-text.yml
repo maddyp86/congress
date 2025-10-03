@@ -27,7 +27,7 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y curl gzip findutils coreutils
+          sudo apt-get install -y curl gzip findutils coreutils python3
 
       - name: Prepare
         run: |
@@ -60,7 +60,6 @@ jobs:
           set -euo pipefail
           USER_AGENT="govinfo-bulk-fetcher/1.0 (+https://your.org)"
           while IFS= read -r url; do
-            # determine bill type from URL path
             bt="other"
             for candidate in $BILL_TYPES; do
               if echo "$url" | grep -q "/${candidate}/"; then
@@ -100,42 +99,12 @@ jobs:
             fi
           done || true
 
-      - name: Build latest_billtext and per-billtype data.json
+      - name: Build manifests
         run: |
           set -euo pipefail
-          rm -rf latest_billtext
-          cp -a data latest_billtext
-
-          TS="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-          for d in latest_billtext/*; do
-            [ -d "$d" ] || continue
-            bt="$(basename "$d")"
-            XML_COUNT=$(find "$d" -type f -name '*.xml' 2>/dev/null | wc -l || echo 0)
-            cat > "$d/data.json" <<EOF
-{
-  "bill_type": "${bt}",
-  "xml_count": ${XML_COUNT},
-  "generated_at": "${TS}"
-}
-EOF
-          done
-
-          MANIFEST_TS="$(date -u +"%Y%m%dT%H%M%SZ")"
-          echo -n "{ \"generated_at\": \"${MANIFEST_TS}\", \"congress\": \"${CONGRESS}\", \"session\": \"${SESSION}\", \"bill_types\": [" > billtext-manifest.json
-          first=true
-          for d in latest_billtext/*; do
-            [ -d "$d" ] || continue
-            bt="$(basename "$d")"
-            cnt=$(jq -r '.xml_count' "$d/data.json" 2>/dev/null || echo 0)
-            if [ "$first" = true ]; then
-              first=false
-            else
-              echo -n "," >> billtext-manifest.json
-            fi
-            echo -n " { \"bill_type\": \"${bt}\", \"xml_count\": ${cnt} }" >> billtext-manifest.json
-          done
-          echo " ] }" >> billtext-manifest.json
-          echo "Manifest created."
+          PYTHON=$(which python3 || echo python3)
+          echo "Running build_manifests.py via $PYTHON"
+          $PYTHON -u scripts/build_manifests.py
 
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
