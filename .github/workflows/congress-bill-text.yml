@@ -73,7 +73,7 @@ jobs:
           echo "Syncing GCS -> local data for Congress 119, type ${{ matrix.bill_type }}"
           gsutil -m rsync -r "gs://${GCS_BUCKET}/${TARGET_PREFIX}" "data/119/bills/${{ matrix.bill_type }}" || true
 
-      - name: Fetch GOVInfo Bill Text by type (incremental)
+      - name: Fetch GOVInfo Bill Text (Filtered by Type)
         run: |
           set -euo pipefail
           . env/bin/activate
