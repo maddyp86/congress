@@ -1,4 +1,4 @@
-name: Collect Congress Bill Text v2 (119)
+name: Collect Congress Bill Text (119)
 
 on:
   workflow_dispatch: {}
@@ -23,6 +23,7 @@ env:
 jobs:
   download_billtext:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
 
@@ -30,93 +31,39 @@ jobs:
         run: sudo apt-get update -y && sudo apt-get install -y jq curl python3
 
       - name: Fetch bulkdata + normalize
-        shell: bash
         run: |
           set -euo pipefail
           mkdir -p "data/${CONGRESS}/bills"
 
-          BASE_A="https://www.govinfo.gov/bulkdata/json/BILLS/${CONGRESS}/${SESSION}"
-          BASE_B="https://www.govinfo.gov/bulkdata/BILLS/${CONGRESS}/${SESSION}"
+          BASE_URL="https://www.govinfo.gov/bulkdata/json/BILLS/${CONGRESS}/${SESSION}"
 
-          fetch_index_urls() {
-            local bt="$1"
-            # Try JSON listing (A) then explicit index.json (B). Retry each a few times.
-            for attempt in {1..4}; do
-              # First try path that negotiates JSON via header
-              if content="$(curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors \
-                               -H 'Accept: application/json' "${BASE_A}/${bt}" 2>/dev/null || true)"; then
-                if jq -e '.files | length > 0' >/dev/null 2>&1 <<<"$content"; then
-                  jq -r '.files[].url' <<<"$content"
-                  return 0
-                fi
-              fi
-
-              # Fallback: explicit index.json under the non-json base
-              if content="$(curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors \
-                               "${BASE_B}/${bt}/index.json" 2>/dev/null || true)"; then
-                if jq -e '.files | length > 0' >/dev/null 2>&1 <<<"$content"; then
-                  jq -r '.files[].url' <<<"$content"
-                  return 0
-                fi
-              fi
-
-              sleep 2
-            done
-
-            return 1
-          }
-
-          download_with_retry() {
-            local url="$1" dest="$2"
-            for attempt in {1..5}; do
-              if curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors -o "$dest" "$url"; then
-                return 0
-              fi
-              sleep 2
-            done
-            return 1
-          }
-
-          # 1) Download XMLs
-          total=0
           for BT in $BILL_TYPES; do
-            echo "Fetching list for ${BT}..."
-            if ! mapfile -t URLS < <(fetch_index_urls "$BT"); then
-              echo "⚠️  Could not fetch index for ${BT}. Skipping this bill type."
-              continue
-            fi
-
-            for URL in "${URLS[@]}"; do
-              [[ -z "${URL}" ]] && continue
-              FNAME="$(basename "$URL")"
-              BILL_DIR="data/${CONGRESS}/bills/${BT}/${FNAME%.*}"
-              mkdir -p "$BILL_DIR"
-              DEST="${BILL_DIR}/${FNAME}"
-              if [[ -f "$DEST" ]]; then
-                continue
-              fi
-              if download_with_retry "$URL" "$DEST"; then
-                total=$((total+1))
-              else
-                echo "⚠️  Failed to download $URL after retries."
-              fi
-            done
+            echo "Fetching $BT..."
+            curl -fsSL -H "Accept: application/json" "${BASE_URL}/${BT}" | \
+              jq -r '.files[].url' | while read -r URL; do
+                [ -z "$URL" ] && continue
+                FNAME="$(basename "$URL")"
+                BILL_DIR="data/${CONGRESS}/bills/${BT}/${FNAME%.*}"
+                mkdir -p "$BILL_DIR"
+                DEST="${BILL_DIR}/${FNAME}"
+                if [ ! -f "$DEST" ]; then
+                  curl -fsSL -o "$DEST" "$URL"
+                fi
+              done
           done
 
-          echo "Downloaded new XML files: $total"
-
-          # 2) Normalize → data.json + build manifest
+          # Normalize + manifest
           python3 <<'EOF'
           import pathlib, json, re
           from datetime import datetime, timezone
 
           base = pathlib.Path("data") / "${CONGRESS}" / "bills"
-          count = 0
           rx = re.compile(r"BILLS-(\d+)([a-z]+)(\d+)([a-z]+)\.xml", re.I)
+          count = 0
 
           for xml in base.rglob("*.xml"):
               m = rx.match(xml.name)
-              if not m:
+              if not m: 
                   continue
               congress, bt, num, version = m.groups()
               bill_id = f"{bt}{int(num)}-{congress}".lower()
@@ -132,7 +79,7 @@ jobs:
                   "issued_on": datetime.fromtimestamp(xml.stat().st_mtime, tz=timezone.utc).strftime("%Y-%m-%d"),
                   "urls": urls,
               }
-              (xml.parent / "data.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+              (xml.parent/"data.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
               count += 1
 
           manifest = {
