@@ -73,7 +73,7 @@ jobs:
           echo "Syncing GCS -> local data for Congress 119, type ${{ matrix.bill_type }}"
           gsutil -m rsync -r "gs://${GCS_BUCKET}/${TARGET_PREFIX}" "data/119/bills/${{ matrix.bill_type }}" || true
 
-      - name: Fetch GOVInfo Bill Text (Filtered by Type)
+      - name: Fetch GOVInfo Bill Text (update only)
         run: |
           set -euo pipefail
           . env/bin/activate
@@ -86,6 +86,7 @@ jobs:
               --bill-type=${{ matrix.bill_type }} \
               --store=mods,xml,text \
               --bulkdata="False" \
+              --update \
               || { echo "::error:: usc-run govinfo failed for Congress $C ${{ matrix.bill_type }}"; exit 1; }
           done
 
