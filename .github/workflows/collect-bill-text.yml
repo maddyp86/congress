@@ -1,4 +1,4 @@
-name: Bill Text Congress 119
+name: Collect Congress Bill Text v2 (119)
 
 on:
   workflow_dispatch: {}
