@@ -13,65 +13,76 @@ permissions:
   contents: read
 
 env:
+  # defaults; override via repo secrets if needed
   CONGRESSES: ${{ secrets.CONGRESSES || '119' }}
   GCS_BUCKET: ${{ secrets.GCS_BUCKET || 'congress-legislative-data' }}
   GCS_PREFIX: ${{ secrets.GCS_PREFIX || 'congress-billtext-data' }}
   GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
 
 jobs:
-  # ----------------------
-  # Matrix: Fetch raw bill data by type
-  # ----------------------
-  fetch_billtext:
+  collect_billtext:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        bill_type: [hr, s, hjres, sjres, hconres, sconres, hres, sres]
-      fail-fast: false
 
     steps:
       - name: Checkout Repo
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: "3.11"
 
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/pyproject.toml', '**/requirements*.txt', '**/setup.cfg', '**/setup.py') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
       - name: Install System Libs
         run: |
+          set -euo pipefail
           sudo apt-get update -y
           sudo apt-get install -y python3-venv jq zip unzip rsync
 
-      - name: Create venv & install Congress tool
+      - name: Create venv & install Congress tool + local package
+        env:
+          PIP_CACHE_DIR: ${{ runner.temp }}/pip-cache
         run: |
+          set -euo pipefail
+          python -V
+          python -m pip install --upgrade pip
           python -m venv env
           . env/bin/activate
           python -m pip install --upgrade pip
+          # install the official CLI (usc-run) from unitedstates/congress
           python -m pip install "git+https://github.com/unitedstates/congress.git"
+          # install local repository in editable mode so local modules (e.g., billtext) are importable
           python -m pip install -e .
+          # export interpreter path for later steps
           echo "PYTHON=./env/bin/python" >> $GITHUB_ENV
           echo "PYTHONUNBUFFERED=1" >> $GITHUB_ENV
 
-      - name: Authenticate to GCP
-        uses: google-github-actions/auth@v2
-        with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
+      - name: Verify required env
+        run: |
+          set -euo pipefail
+          : "${GCP_PROJECT:?Missing required secret GCP_PROJECT}"
+          : "${GCS_BUCKET:?Missing required GCS_BUCKET}"
 
-      - name: Setup gcloud
-        uses: google-github-actions/setup-gcloud@v2
-        with:
-          project_id: ${{ env.GCP_PROJECT }}
-          version: '>= 472.0.0'
+      - name: Ensure data dir
+        run: mkdir -p data
 
+      # NEW STEP: restore last run’s data before update
       - name: Restore previous data from GCS
         run: |
           set -euo pipefail
-          mkdir -p data/119/bills/${{ matrix.bill_type }}
           PREFIX="${GCS_PREFIX%/}"
-          TARGET_PREFIX="${PREFIX:+${PREFIX}/}data/119/bills/${{ matrix.bill_type }}"
-          echo "Syncing GCS -> local data for Congress 119, type ${{ matrix.bill_type }}"
-          gsutil -m rsync -r "gs://${GCS_BUCKET}/${TARGET_PREFIX}" "data/119/bills/${{ matrix.bill_type }}" || true
+          TARGET_PREFIX="${PREFIX:+${PREFIX}/}data"
+          echo "Restoring previous bill data from GCS -> local data/"
+          gsutil -m rsync -r "gs://${GCS_BUCKET}/${TARGET_PREFIX}" "data" || true
 
       - name: Fetch GOVInfo Bill Text (update only)
         run: |
@@ -79,60 +90,14 @@ jobs:
           . env/bin/activate
           IFS=',' read -ra CONS <<< "${CONGRESSES}"
           for C in "${CONS[@]}"; do
-            echo "Fetching Congress $C, type ${{ matrix.bill_type }}"
-            usc-run govinfo \
-              --collections=BILLS \
-              --congress="$C" \
-              --bill-type=${{ matrix.bill_type }} \
-              --store=mods,xml,text \
-              --bulkdata="False" \
-              --update \
-              || { echo "::error:: usc-run govinfo failed for Congress $C ${{ matrix.bill_type }}"; exit 1; }
+            C="$(echo "$C" | xargs)"
+            echo "Fetching BILLS text for Congress $C (update only)"
+            # --update ensures only new/changed bills are pulled
+            usc-run govinfo --collections=BILLS --congress="$C" --store=mods,xml,text --bulkdata="False" --update \
+              || { echo "::error:: usc-run govinfo failed for Congress $C"; exit 1; }
           done
-
-      - name: Upload updated data back to GCS
-        run: |
-          set -euo pipefail
-          PREFIX="${GCS_PREFIX%/}"
-          TARGET_PREFIX="${PREFIX:+${PREFIX}/}data/119/bills/${{ matrix.bill_type }}"
-          echo "Syncing local -> GCS for ${{ matrix.bill_type }}"
-          gsutil -m rsync -r "data/119/bills/${{ matrix.bill_type }}" "gs://${GCS_BUCKET}/${TARGET_PREFIX}"
-
-  # ----------------------
-  # Aggregation Job
-  # ----------------------
-  aggregate_billtext:
-    runs-on: ubuntu-latest
-    needs: fetch_billtext
-
-    steps:
-      - name: Checkout Repo
-        uses: actions/checkout@v4
-
-      - name: Install System Libs
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y python3-venv jq zip unzip rsync
-
-      - name: Authenticate to GCP
-        uses: google-github-actions/auth@v2
-        with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
-
-      - name: Setup gcloud
-        uses: google-github-actions/setup-gcloud@v2
-        with:
-          project_id: ${{ env.GCP_PROJECT }}
-          version: '>= 472.0.0'
-
-      - name: Restore full data tree from GCS
-        run: |
-          set -euo pipefail
-          mkdir -p data
-          PREFIX="${GCS_PREFIX%/}"
-          TARGET_PREFIX="${PREFIX:+${PREFIX}/}data/119"
-          echo "Syncing GCS -> local full data for Congress 119..."
-          gsutil -m rsync -r "gs://${GCS_BUCKET}/${TARGET_PREFIX}" "data/119"
+          # build the billtext outputs
+          usc-run billtext || { echo "::error:: usc-run billtext failed"; exit 1; }
 
       - name: Unzip billtext packages
         run: |
@@ -152,29 +117,28 @@ jobs:
           if [ "$found" -eq 0 ]; then
             echo "No package.zip files found (this can be okay if upstream writes files directly)."
           fi
+          echo "Verification: counts and sample paths"
+          echo "data.json count under data/:"
+          find data -type f -name data.json | wc -l
+          echo "Some sample files under text-versions:"
+          find data -type f -path "*/bills/*/*/text-versions/*/*" | sed -n '1,30p' || true
 
       - name: Quick Debug
         run: |
+          set -euo pipefail
           echo "Total data.json files under data/: $(find data -type f -name data.json | wc -l || true)"
           echo "Sample text-version data.json (data/*/bills/*/*/text-versions/*/data.json):"
           find data -type f -path "data/*/bills/*/*/text-versions/*/data.json" | sort | sed -n '1,100p' || true
 
-      - name: Run usc-run billtext
+      - name: Build Bill Text
         run: |
-          python -m venv env
-          . env/bin/activate
-          python -m pip install --upgrade pip
-          python -m pip install "git+https://github.com/unitedstates/congress.git"
-          python -m pip install -e .
-          usc-run billtext
-
-      - name: Build Latest Bill Text
-        run: |
-          . env/bin/activate
+          set -euo pipefail
+          echo "Running latest-bill-text via $PYTHON"
           $PYTHON -u scripts/latest-bill-text.py
 
       - name: Debug Bill Text
         run: |
+          set -euo pipefail
           echo "latest_billtext exists?"; [ -d latest_billtext ] && echo "yes" || echo "no"
           echo "latest_billtext data.json count:"; find latest_billtext -type f -name data.json | wc -l || true
           echo "Sample latest_billtext files (up to 200):"
@@ -182,11 +146,13 @@ jobs:
 
       - name: Build manifests
         run: |
-          . env/bin/activate
+          set -euo pipefail
+          echo "Running build_manifests.py via $PYTHON"
           $PYTHON -u scripts/build_manifests.py
 
       - name: Manifest sanity checks
         run: |
+          set -euo pipefail
           if [ ! -f billtext-manifest.json ]; then
             echo "::error:: billtext-manifest.json not found; aborting"
             exit 1
@@ -198,24 +164,43 @@ jobs:
             exit 1
           fi
 
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.GCP_PROJECT }}
+          version: '>= 472.0.0'
+
+      - name: Ensure GCS bucket exists
+        run: |
+          set -euo pipefail
+          gsutil ls -b "gs://${GCS_BUCKET}" >/dev/null 2>&1 || gsutil mb -p "${GCP_PROJECT}" "gs://${GCS_BUCKET}"
+
       - name: Upload Bill Text to GCS
         run: |
+          set -euo pipefail
           PREFIX="${GCS_PREFIX%/}"
           TARGET_PREFIX="${PREFIX:+${PREFIX}/}data"
-          echo "Uploading latest_billtext -> gs://${GCS_BUCKET}/${TARGET_PREFIX}/"
+          echo "Uploading latest_billtext -> gs://${GCS_BUCKET}/${TARGET_PREFIX}/ (non-destructive rsync)"
           gsutil -m rsync -r "latest_billtext" "gs://${GCS_BUCKET}/${TARGET_PREFIX}/"
 
       - name: Upload manifest to GCS
         run: |
+          set -euo pipefail
           PREFIX="${GCS_PREFIX%/}"
           GS_PREFIX="${PREFIX:+${PREFIX}/}manifests"
           echo "Uploading manifest file to gs://${GCS_BUCKET}/${GS_PREFIX}/"
-          gsutil -m cp -n billtext-manifest.json "gs://${GCS_BUCKET}/${GS_PREFIX}/" || true
+          gsutil -m cp -n billtext-manifest.json "gs://${GCS_BUCKET}/${GS_PREFIX}/" || { echo "::warning:: manifest upload may have failed"; }
 
       - name: Summary
         run: |
+          set -euo pipefail
           COUNT_TEXT=$(find latest_billtext -type f -name data.json 2>/dev/null | wc -l || echo 0)
-          echo "Completed billtext aggregation."
+          echo "Completed billtext run."
           echo "latest_billtext JSON count: ${COUNT_TEXT}"
           echo "Bucket: ${GCS_BUCKET}"
           echo "Prefix: ${GCS_PREFIX}"
