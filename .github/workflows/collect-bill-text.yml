@@ -3,48 +3,98 @@ name: Collect Congress Bill Text v2 (119)
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "30 9 * * *" # daily
+    - cron: "30 9 * * *" # nightly (09:30 UTC)
 
 concurrency:
-  group: sync-billtext-xml
+  group: collect-congress-billtext
   cancel-in-progress: true
 
 permissions:
   contents: read
 
 env:
+  CONGRESSES: ${{ secrets.CONGRESSES || '119' }}
   GCS_BUCKET: ${{ secrets.GCS_BUCKET || 'congress-legislative-data' }}
-  GCS_PREFIX: ${{ secrets.GCS_PREFIX || 'congress-billtext-xml' }}
+  GCS_PREFIX: ${{ secrets.GCS_PREFIX || 'congress-billtext-data' }}
   GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
 
 jobs:
-  sync_billtext:
+  collect_billtext:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Install Tools
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+
+      - name: Install System Libs
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y wget jq
+          sudo apt-get install -y python3-venv jq zip unzip rsync wget
 
-      - name: Download bill XML from GovInfo
+      - name: Ensure data dir
+        run: mkdir -p data/119/bills
+
+      - name: Download bulkdata XML from GovInfo
         run: |
           set -euo pipefail
-          mkdir -p data/119
-          cd data/119
           BILL_TYPES=("hconres" "hjres" "hr" "hres" "s" "sconres" "sjres" "sres")
           for TYPE in "${BILL_TYPES[@]}"; do
-            echo "Downloading $TYPE..."
-            wget -r -np -nH -N --cut-dirs=3 \
-              https://www.govinfo.gov/bulkdata/BILLS/119/1/$TYPE/ \
-              -A "*.xml"
+            echo "Fetching bill type: $TYPE ..."
+            mkdir -p "data/119/bills/$TYPE"
+            wget -nc -r -np -nH --cut-dirs=6 -A "BILLS-*.xml" \
+              -P "data/119/bills/$TYPE" \
+              "https://www.govinfo.gov/bulkdata/BILLS/119/1/$TYPE/"
           done
 
-      - name: Build manifest
+      - name: Normalize GovInfo XMLs into data.json
         run: |
-          cd data/119
-          find . -type f -name "*.xml" | sort | jq -R . | jq -s '{file_count: length, files: .}' > billtext-manifest.json
-          cat billtext-manifest.json
+          set -euo pipefail
+          cat > normalize-bulkdata.py <<'EOF'
+          import json, pathlib, re
+          from datetime import datetime
+
+          base = pathlib.Path("data/119/bills")
+
+          for xml in base.rglob("BILLS-*.xml"):
+              fname = xml.stem  # e.g., BILLS-119hconres1eh
+              m = re.match(r"BILLS-(\d+)([a-z]+)(\d+)([a-z]+)", fname)
+              if not m:
+                  print("SKIP unparsable filename:", fname)
+                  continue
+
+              congress, bill_type, num, version = m.groups()
+              bill_id = f"{bill_type}{int(num)}-{congress}"
+              version_code = version
+
+              urls = {
+                  "html": f"https://www.govinfo.gov/content/pkg/{fname}/html/{fname}.htm",
+                  "pdf": f"https://www.govinfo.gov/content/pkg/{fname}/pdf/{fname}.pdf",
+                  "xml": f"https://www.govinfo.gov/content/pkg/{fname}/xml/{fname}.xml",
+                  "unknown": f"https://www.govinfo.gov/app/details/{fname}"
+              }
+
+              # create nested path like data/119/bills/hr/hr1eh/
+              bill_dir = xml.parent / f"{bill_type}{int(num)}{version}"
+              bill_dir.mkdir(parents=True, exist_ok=True)
+
+              target = bill_dir / "data.json"
+              data = {
+                  "issued_on": datetime.today().strftime("%Y-%m-%d"),  # fallback
+                  "version_code": version_code,
+                  "bill_id": bill_id,
+                  "bill_id_source": "filename",
+                  "urls": urls
+              }
+              with open(target, "w") as f:
+                  json.dump(data, f, indent=2)
+              print("WROTE", target)
+          EOF
+          python3 normalize-bulkdata.py
 
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
@@ -55,18 +105,36 @@ jobs:
         uses: google-github-actions/setup-gcloud@v2
         with:
           project_id: ${{ env.GCP_PROJECT }}
+          version: '>= 472.0.0'
 
-      - name: Upload bill XML to GCS
+      - name: Ensure GCS bucket exists
         run: |
-          gsutil -m rsync -r data/119 "gs://${GCS_BUCKET}/${GCS_PREFIX}/data/119"
+          gsutil ls -b "gs://${GCS_BUCKET}" >/dev/null 2>&1 || gsutil mb -p "${GCP_PROJECT}" "gs://${GCS_BUCKET}"
 
-      - name: Upload manifest
+      - name: Upload Bill Text to GCS
         run: |
-          gsutil cp billtext-manifest.json "gs://${GCS_BUCKET}/${GCS_PREFIX}/manifests/"
-      
+          set -euo pipefail
+          PREFIX="${GCS_PREFIX%/}"
+          TARGET_PREFIX="${PREFIX:+${PREFIX}/}data/119"
+          echo "Uploading normalized bill text -> gs://${GCS_BUCKET}/${TARGET_PREFIX}/"
+          gsutil -m rsync -r "data/119" "gs://${GCS_BUCKET}/${TARGET_PREFIX}/"
+
+      - name: Build manifest
+        run: |
+          set -euo pipefail
+          find data/119 -name data.json | sort > file_list.txt
+          jq -n --argjson files "$(jq -R . < file_list.txt | jq -s .)" '{file_count: $files | length, files: $files}' > billtext-manifest.json
+
+      - name: Upload manifest to GCS
+        run: |
+          PREFIX="${GCS_PREFIX%/}"
+          GS_PREFIX="${PREFIX:+${PREFIX}/}manifests"
+          echo "Uploading manifest file to gs://${GCS_BUCKET}/${GS_PREFIX}/"
+          gsutil -m cp -n billtext-manifest.json "gs://${GCS_BUCKET}/${GS_PREFIX}/" || true
+
       - name: Summary
         run: |
-          echo "Completed bulk billtext sync"
+          echo "Completed GovInfo bulkdata sync"
           echo "Bucket: ${GCS_BUCKET}"
           echo "Prefix: ${GCS_PREFIX}/data/119"
-          jq '.file_count' data/119/billtext-manifest.json
+          jq '.file_count' billtext-manifest.json
