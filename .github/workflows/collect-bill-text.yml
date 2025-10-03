@@ -1,4 +1,4 @@
-name: Sync Bill Text XML from GovInfo
+name: Bill Text Congress 119
 
 on:
   workflow_dispatch: {}
