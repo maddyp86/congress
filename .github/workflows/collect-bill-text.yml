@@ -1,104 +1,50 @@
-name: Collect Congress Bill Text (119)
+name: Sync Bill Text XML from GovInfo
 
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "30 9 * * *" # nightly (09:30 UTC)
+    - cron: "30 9 * * *" # daily
 
 concurrency:
-  group: collect-congress-billtext
+  group: sync-billtext-xml
   cancel-in-progress: true
 
 permissions:
   contents: read
 
 env:
-  CONGRESSES: ${{ secrets.CONGRESSES || '119' }}
   GCS_BUCKET: ${{ secrets.GCS_BUCKET || 'congress-legislative-data' }}
-  GCS_PREFIX: ${{ secrets.GCS_PREFIX || 'congress-billtext-data' }}
+  GCS_PREFIX: ${{ secrets.GCS_PREFIX || 'congress-billtext-xml' }}
   GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
 
 jobs:
-  collect_billtext:
+  sync_billtext:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout Repo
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: "3.11"
-
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/pyproject.toml', '**/requirements*.txt', '**/setup.cfg', '**/setup.py') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
-      - name: Install System Libs
+      - name: Install Tools
         run: |
-          set -euo pipefail
           sudo apt-get update -y
-          sudo apt-get install -y python3-venv jq zip unzip wget rsync
+          sudo apt-get install -y wget jq
 
-      - name: Ensure data dir
-        run: mkdir -p data/119/bills
-
-      # 🔹 NEW: Direct recursive bulkdata download from GovInfo
-      - name: Download bulkdata from GovInfo
+      - name: Download bill XML from GovInfo
         run: |
           set -euo pipefail
-          echo "Downloading all bulkdata bill text files for 119th Congress (1st session)..."
-          wget -r -np -nH --cut-dirs=4 -R "index.html*" \
-            -P data/119/bills \
-            https://www.govinfo.gov/bulkdata/BILLS/119/1/
-          echo "Download complete. Sample files:"
-          find data/119/bills -type f | sed -n '1,50p'
+          mkdir -p data/119
+          cd data/119
+          BILL_TYPES=("hconres" "hjres" "hr" "hres" "s" "sconres" "sjres" "sres")
+          for TYPE in "${BILL_TYPES[@]}"; do
+            echo "Downloading $TYPE..."
+            wget -r -np -nH -N --cut-dirs=3 \
+              https://www.govinfo.gov/bulkdata/BILLS/119/1/$TYPE/ \
+              -A "*.xml"
+          done
 
-      - name: Quick Debug
+      - name: Build manifest
         run: |
-          echo "Total files under data/: $(find data -type f | wc -l || true)"
-          echo "Sample structure:"
-          find data/119/bills -type f | head -n 100 || true
-
-      - name: Build Latest Bill Text
-        run: |
-          python -m venv env
-          . env/bin/activate
-          python -m pip install --upgrade pip
-          python -m pip install -e .
-          $PYTHON -u scripts/latest-bill-text.py
-
-      - name: Debug Bill Text
-        run: |
-          echo "latest_billtext exists?"; [ -d latest_billtext ] && echo "yes" || echo "no"
-          echo "latest_billtext data.json count:"; find latest_billtext -type f -name data.json | wc -l || true
-          echo "Sample latest_billtext files:"
-          find latest_billtext -type f -name data.json | sort | head -n 200 || true
-
-      - name: Build manifests
-        run: |
-          . env/bin/activate
-          $PYTHON -u scripts/build_manifests.py
-
-      - name: Manifest sanity checks
-        run: |
-          if [ ! -f billtext-manifest.json ]; then
-            echo "::error:: billtext-manifest.json not found; aborting"
-            exit 1
-          fi
-          BILLCOUNT=$(jq '.files | length' billtext-manifest.json 2>/dev/null || echo 0)
-          echo "billtext-manifest.json contains ${BILLCOUNT} entries"
-          if [ "${BILLCOUNT}" -lt 1 ]; then
-            echo "::error:: billtext-manifest.json is empty; aborting upload (safety)"
-            exit 1
-          fi
+          cd data/119
+          find . -type f -name "*.xml" | sort | jq -R . | jq -s '{file_count: length, files: .}' > billtext-manifest.json
+          cat billtext-manifest.json
 
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
@@ -109,33 +55,18 @@ jobs:
         uses: google-github-actions/setup-gcloud@v2
         with:
           project_id: ${{ env.GCP_PROJECT }}
-          version: '>= 472.0.0'
 
-      - name: Ensure GCS bucket exists
+      - name: Upload bill XML to GCS
         run: |
-          set -euo pipefail
-          gsutil ls -b "gs://${GCS_BUCKET}" >/dev/null 2>&1 || gsutil mb -p "${GCP_PROJECT}" "gs://${GCS_BUCKET}"
+          gsutil -m rsync -r data/119 "gs://${GCS_BUCKET}/${GCS_PREFIX}/data/119"
 
-      - name: Upload Bill Text to GCS
+      - name: Upload manifest
         run: |
-          set -euo pipefail
-          PREFIX="${GCS_PREFIX%/}"
-          TARGET_PREFIX="${PREFIX:+${PREFIX}/}data"
-          echo "Uploading latest_billtext -> gs://${GCS_BUCKET}/${TARGET_PREFIX}/"
-          gsutil -m rsync -r "latest_billtext" "gs://${GCS_BUCKET}/${TARGET_PREFIX}/"
-
-      - name: Upload manifest to GCS
-        run: |
-          set -euo pipefail
-          PREFIX="${GCS_PREFIX%/}"
-          GS_PREFIX="${PREFIX:+${PREFIX}/}manifests"
-          echo "Uploading manifest file to gs://${GCS_BUCKET}/${GS_PREFIX}/"
-          gsutil -m cp -n billtext-manifest.json "gs://${GCS_BUCKET}/${GS_PREFIX}/" || true
-
+          gsutil cp billtext-manifest.json "gs://${GCS_BUCKET}/${GCS_PREFIX}/manifests/"
+      
       - name: Summary
         run: |
           echo "Completed bulk billtext sync"
           echo "Bucket: ${GCS_BUCKET}"
-          echo "Prefix: ${GCS_PREFIX}/data"
-          echo "Manifest: billtext-manifest.json"
-          jq '.file_count' billtext-manifest.json || true
+          echo "Prefix: ${GCS_PREFIX}/data/119"
+          jq '.file_count' data/119/billtext-manifest.json
