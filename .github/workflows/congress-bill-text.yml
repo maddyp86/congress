@@ -19,42 +19,32 @@ env:
   GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
 
 jobs:
-  collect_billtext:
+  # ----------------------
+  # Matrix: Fetch raw data per bill type
+  # ----------------------
+  fetch_billtext:
     runs-on: ubuntu-latest
-
     strategy:
       matrix:
         bill_type: [hr, s, hjres, sjres, hconres, sconres, hres, sres]
-      fail-fast: false   # ensures one type failing doesn’t cancel the rest
+      fail-fast: false
 
     steps:
       - name: Checkout Repo
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
 
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: "3.11"
 
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/pyproject.toml', '**/requirements*.txt', '**/setup.cfg', '**/setup.py') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
       - name: Install System Libs
         run: |
-          set -euo pipefail
           sudo apt-get update -y
           sudo apt-get install -y python3-venv jq zip unzip
 
-      - name: Create venv & install Congress tool + local package
+      - name: Create venv & install Congress tool
         run: |
-          set -euo pipefail
           python -m venv env
           . env/bin/activate
           python -m pip install --upgrade pip
@@ -63,52 +53,78 @@ jobs:
           echo "PYTHON=./env/bin/python" >> $GITHUB_ENV
           echo "PYTHONUNBUFFERED=1" >> $GITHUB_ENV
 
-      - name: Verify required env
-        run: |
-          : "${GCP_PROJECT:?Missing required secret GCP_PROJECT}"
-          : "${GCS_BUCKET:?Missing required GCS_BUCKET}"
-
-      - name: Ensure data dir
-        run: mkdir -p data
-
-      - name: Fetch GOVInfo Bill Text (matrix by bill_type)
+      - name: Fetch GOVInfo Bill Text by type
         run: |
           set -euo pipefail
           . env/bin/activate
           IFS=',' read -ra CONS <<< "${CONGRESSES}"
           for C in "${CONS[@]}"; do
-            C="$(echo "$C" | xargs)"
-            echo "Fetching BILLS text for Congress $C, type ${{ matrix.bill_type }}"
+            echo "Fetching Congress $C, type ${{ matrix.bill_type }}"
             usc-run govinfo \
               --collections=BILLS \
               --congress="$C" \
               --bill-type=${{ matrix.bill_type }} \
               --store=mods,xml,text \
               --bulkdata="False" \
-              --update \
-              || { echo "::error:: usc-run govinfo failed for Congress $C type ${{ matrix.bill_type }}"; exit 1; }
+              || { echo "::error:: usc-run govinfo failed for Congress $C ${{ matrix.bill_type }}"; exit 1; }
           done
-          usc-run billtext || { echo "::error:: usc-run billtext failed"; exit 1; }
 
-      - name: Upload Bill Text to GCS
+      # Upload raw `data/` from this job
+      - name: Upload raw data artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: billtext-${{ matrix.bill_type }}
+          path: data/
+
+  # ----------------------
+  # Aggregation Job
+  # ----------------------
+  aggregate_billtext:
+    runs-on: ubuntu-latest
+    needs: fetch_billtext
+
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: data-raw
+
+      - name: Merge artifacts into data/
+        run: |
+          mkdir -p data
+          # Merge all bill types under a single "data/" tree
+          for d in data-raw/*; do
+            rsync -a "$d/" data/
+          done
+          echo "Merged data tree:"
+          find data -maxdepth 4 | head -n 50
+
+      - name: Run usc-run billtext
+        run: |
+          . env/bin/activate || python -m venv env && . env/bin/activate
+          python -m pip install --upgrade pip
+          python -m pip install "git+https://github.com/unitedstates/congress.git"
+          python -m pip install -e .
+          usc-run billtext
+
+      - name: Build Latest Bill Text
+        run: |
+          . env/bin/activate
+          $PYTHON -u scripts/latest-bill-text.py
+
+      - name: Build manifests
+        run: |
+          . env/bin/activate
+          $PYTHON -u scripts/build_manifests.py
+
+      - name: Upload to GCS
         run: |
           set -euo pipefail
           PREFIX="${GCS_PREFIX%/}"
-          TARGET_PREFIX="${PREFIX:+${PREFIX}/}data/${{ matrix.bill_type }}"
-          echo "Uploading latest_billtext/${{ matrix.bill_type }} -> gs://${GCS_BUCKET}/${TARGET_PREFIX}/"
+          TARGET_PREFIX="${PREFIX:+${PREFIX}/}data"
           gsutil -m rsync -r "latest_billtext" "gs://${GCS_BUCKET}/${TARGET_PREFIX}/"
-
-      - name: Upload manifest to GCS
-        run: |
-          set -euo pipefail
-          PREFIX="${GCS_PREFIX%/}"
           GS_PREFIX="${PREFIX:+${PREFIX}/}manifests"
-          gsutil -m cp -n billtext-manifest.json "gs://${GCS_BUCKET}/${GS_PREFIX}/" || echo "::warning:: manifest upload may have failed"
-
-      - name: Summary
-        run: |
-          COUNT_TEXT=$(find latest_billtext -type f -name data.json 2>/dev/null | wc -l || echo 0)
-          echo "Completed billtext run for type ${{ matrix.bill_type }}."
-          echo "latest_billtext JSON count: ${COUNT_TEXT}"
-          echo "Bucket: ${GCS_BUCKET}"
-          echo "Prefix: ${GCS_PREFIX}"
+          gsutil -m cp -n billtext-manifest.json "gs://${GCS_BUCKET}/${GS_PREFIX}/" || true
