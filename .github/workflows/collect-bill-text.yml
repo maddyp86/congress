@@ -1,4 +1,4 @@
-name: Collect Congress Bill Text v2 (119)
+name: Collect Congress Bill Text (119)
 
 on:
   workflow_dispatch: {}
@@ -16,137 +16,81 @@ env:
   GCS_BUCKET: ${{ secrets.GCS_BUCKET || 'congress-legislative-data' }}
   GCS_PREFIX: ${{ secrets.GCS_PREFIX || 'congress-billtext-xml' }}
   GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
+  BILL_TYPES: "hr s hjres sjres hconres sconres hres sres"
 
 jobs:
   download_billtext:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout Repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Install Tools
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y jq curl unzip rsync python3 python3-pip
+      - name: Install deps
+        run: sudo apt-get update -y && sudo apt-get install -y jq curl python3 python3-pip
 
-      - name: Download GovInfo bulkdata JSON index + XML files
+      - name: Fetch bulkdata + normalize
         run: |
           set -euo pipefail
           mkdir -p data/119/bills
-          
-          BILL_TYPES=("hr" "s" "hjres" "sjres" "hconres" "sconres" "hres" "sres")
           BASE_URL="https://www.govinfo.gov/bulkdata/json/BILLS/119/1"
 
-          for BT in "${BILL_TYPES[@]}"; do
-            echo "Fetching JSON index for $BT..."
-            curl -s "${BASE_URL}/${BT}" -H "Accept: application/json" -o index.json
-
-            FILES=$(jq -r '.files[].url' index.json || true)
-            if [ -z "$FILES" ]; then
-              echo "No files found for $BT, skipping..."
-              continue
-            fi
-
-            for URL in $FILES; do
-              FNAME=$(basename "$URL")
-              BILL_DIR="data/119/bills/${BT}/${FNAME%.*}"   # remove .xml
-              mkdir -p "$BILL_DIR"
-              if [ ! -f "$BILL_DIR/$(basename "$URL")" ]; then
-                echo "Downloading $URL -> $BILL_DIR"
-                curl -s -L "$URL" -o "$BILL_DIR/$(basename "$URL")"
-              else
-                echo "Already have $BILL_DIR/$(basename "$URL"), skipping"
-              fi
-            done
+          for BT in $BILL_TYPES; do
+            echo "Fetching $BT..."
+            curl -s "${BASE_URL}/${BT}" -H "Accept: application/json" | \
+              jq -r '.files[].url' | while read -r URL; do
+                [ -z "$URL" ] && continue
+                FNAME=$(basename "$URL")
+                BILL_DIR="data/119/bills/${BT}/${FNAME%.*}"
+                mkdir -p "$BILL_DIR"
+                if [ ! -f "$BILL_DIR/$FNAME" ]; then
+                  curl -s -L "$URL" -o "$BILL_DIR/$FNAME"
+                fi
+              done
           done
 
-      - name: Normalize XML into data.json
-        run: |
-          set -euo pipefail
           python3 <<'EOF'
           import pathlib, json, re
           from datetime import datetime
-
           base = pathlib.Path("data/119/bills")
+          count = 0
 
-          def parse_bill_meta(path: pathlib.Path):
-              fname = path.name
-              # Example: BILLS-119hr123ih.xml → hr123-119
+          for xml in base.rglob("*.xml"):
+              fname = xml.name
               m = re.match(r"BILLS-(\d+)([a-z]+)(\d+)([a-z]+)\.xml", fname, re.I)
-              if not m: 
-                  return None
+              if not m: continue
               congress, bt, num, version = m.groups()
               bill_id = f"{bt}{int(num)}-{congress}".lower()
-              version_code = version.lower()
-              issued = datetime.utcfromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d")
-              # Build canonical URLs
-              pkg = fname.replace(".xml", "")
-              urls = {
-                  "html": f"https://www.govinfo.gov/content/pkg/{pkg}/html/{pkg}.htm",
-                  "pdf": f"https://www.govinfo.gov/content/pkg/{pkg}/pdf/{pkg}.pdf",
-                  "xml": f"https://www.govinfo.gov/content/pkg/{pkg}/xml/{pkg}.xml",
-                  "unknown": f"https://www.govinfo.gov/app/details/{pkg}"
+              pkg = fname.replace(".xml","")
+              urls = {ext: f"https://www.govinfo.gov/content/pkg/{pkg}/{ext}/{pkg}.{ext}"
+                      for ext in ("html","pdf","xml")}
+              meta = {
+                "bill_id": bill_id,
+                "version_code": version.lower(),
+                "issued_on": datetime.utcfromtimestamp(xml.stat().st_mtime).strftime("%Y-%m-%d"),
+                "urls": urls,
               }
-              return {
-                  "issued_on": issued,
-                  "version_code": version_code,
-                  "bill_id": bill_id,
-                  "bill_id_source": "filename",
-                  "urls": urls
-              }
-
-          count = 0
-          for xml in base.rglob("*.xml"):
-              meta = parse_bill_meta(xml)
-              if not meta:
-                  print(f"Skipping unrecognized file: {xml}")
-                  continue
-              out = xml.parent / "data.json"
-              with out.open("w", encoding="utf-8") as f:
-                  json.dump(meta, f, indent=2)
-              print(f"Wrote {out}")
+              (xml.parent/"data.json").write_text(json.dumps(meta, indent=2))
               count += 1
 
-          print(f"Done: wrote {count} data.json files")
+          with open("billtext-manifest.json","w") as f:
+              json.dump({
+                "file_count": count,
+                "generated_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+              }, f, indent=2)
           EOF
 
-      - name: Build manifest
-        run: |
-          set -euo pipefail
-          COUNT=$(find data -type f -name "data.json" | wc -l || true)
-          jq -n \
-            --arg count "$COUNT" \
-            --arg date "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
-            '{file_count: $count|tonumber, generated_at: $date}' > billtext-manifest.json
-          cat billtext-manifest.json
-
-      - name: Authenticate to GCP
-        uses: google-github-actions/auth@v2
+      - uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
-      - name: Setup gcloud
-        uses: google-github-actions/setup-gcloud@v2
+      - uses: google-github-actions/setup-gcloud@v2
         with:
           project_id: ${{ env.GCP_PROJECT }}
-          version: '>= 472.0.0'
 
-      - name: Upload XML + normalized JSON to GCS
+      - name: Upload to GCS
         run: |
-          set -euo pipefail
-          PREFIX="${GCS_PREFIX%/}/data/119"
-          echo "Uploading data -> gs://${GCS_BUCKET}/${PREFIX}/"
-          gsutil -m rsync -r "data/119" "gs://${GCS_BUCKET}/${PREFIX}/"
-
-      - name: Upload manifest to GCS
-        run: |
-          set -euo pipefail
-          PREFIX="${GCS_PREFIX%/}/manifests"
-          echo "Uploading manifest -> gs://${GCS_BUCKET}/${PREFIX}/"
-          gsutil -m cp -n billtext-manifest.json "gs://${GCS_BUCKET}/${PREFIX}/" || true
+          gsutil -m rsync -r data/119 "gs://${GCS_BUCKET}/${GCS_PREFIX}/data/119"
+          gsutil -m cp -n billtext-manifest.json "gs://${GCS_BUCKET}/${GCS_PREFIX}/manifests/"
 
       - name: Summary
-        run: |
-          echo "Completed bulk XML sync with normalization"
-          jq '.' billtext-manifest.json
+        run: cat billtext-manifest.json
