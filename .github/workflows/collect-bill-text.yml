@@ -43,19 +43,17 @@ jobs:
           USER_AGENT="govinfo-bulk-fetcher/1.0 (+https://your.org)"
           for BT in $BILL_TYPES; do
             IDX="index_${BT}.xml"
-            IDX_URL="https://www.govinfo.gov/bulkdata/xml/BILLS/${CONGRESS}/${BT}"
+            IDX_URL="https://www.govinfo.gov/bulkdata/xml/BILLS/${CONGRESS}/${SESSION}/${BT}"
             if curl -fsSL -H "Accept: application/xml" -H "User-Agent: ${USER_AGENT}" "$IDX_URL" -o "$IDX"; then
               grep -Eo 'https?://[^"'"'"'<>[:space:]]+' "$IDX" \
                 | grep -Ei '\.xml(\.gz)?$' \
                 | sort -u >> all_urls.txt || true
-            else
-              echo "WARN: failed to fetch index for $BT"
             fi
           done
           sort -u -o all_urls.txt all_urls.txt || true
           echo "Collected $(wc -l < all_urls.txt || echo 0) XML URLs."
 
-      - name: Download XML files
+      - name: Download XML files (with Accept header)
         run: |
           set -euo pipefail
           USER_AGENT="govinfo-bulk-fetcher/1.0 (+https://your.org)"
