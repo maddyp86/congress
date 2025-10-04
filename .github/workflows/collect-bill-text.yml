@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 env:
-  GCS_BUCKET: ${{ secrets.GCS_BUCKET }}
+  GCS_BUCKET: ${{ secrets.GCS_BUCKET || 'congress-legislative-data' }}
   GCS_PREFIX: ${{ secrets.GCS_PREFIX || 'congress-billtext-xml' }}
   GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
   CONGRESS: "119"
