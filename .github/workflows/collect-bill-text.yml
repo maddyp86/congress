@@ -13,6 +13,7 @@ env:
   GCS_PREFIX: ${{ secrets.GCS_PREFIX || 'congress-billtext-xml' }}
   GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
   CONGRESS: "119"
+  SESSION: "1" 
   BILL_TYPES: "hr s hjres sjres hconres sconres hres sres"
 
 jobs:
