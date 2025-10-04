@@ -38,26 +38,27 @@ jobs:
           echo "Congress: ${CONGRESS}"
           echo "Bill types: ${BILL_TYPES}"
 
-      - name: Collect XML URLs
+      - name: Fetch XML indexes and collect XML URLs
         run: |
           set -euo pipefail
           USER_AGENT="govinfo-bulk-fetcher/1.0 (+https://your.org)"
           for BT in $BILL_TYPES; do
             IDX="index_${BT}.xml"
-            # ✅ Corrected URL: no /SESSION/ in govinfo XML indexes
-            IDX_URL="https://www.govinfo.gov/bulkdata/xml/BILLS/${CONGRESS}/${BT}"
+            # ✅ Reverted: GovInfo requires /SESSION/ in path
+            IDX_URL="https://www.govinfo.gov/bulkdata/xml/BILLS/${CONGRESS}/${SESSION}/${BT}"
+            echo "Fetching $IDX_URL"
             if curl -fsSL -H "Accept: application/xml" -H "User-Agent: ${USER_AGENT}" "$IDX_URL" -o "$IDX"; then
               grep -Eo 'https?://[^"'"'"'<>[:space:]]+' "$IDX" \
                 | grep -Ei '\.xml(\.gz)?$' \
                 | sort -u >> all_urls.txt || true
             else
-              echo "WARN: failed to fetch index for $BT"
+              echo "⚠️ Failed to fetch $IDX_URL"
             fi
           done
           sort -u -o all_urls.txt all_urls.txt || true
-          echo "Collected $(wc -l < all_urls.txt || echo 0) XML URLs."
+          echo "✅ Collected $(wc -l < all_urls.txt || echo 0) XML URLs."
 
-      - name: Download XML files
+      - name: Download XML files (with Accept header)
         run: |
           set -euo pipefail
           USER_AGENT="govinfo-bulk-fetcher/1.0 (+https://your.org)"
@@ -69,7 +70,7 @@ jobs:
                 break
               fi
             done
-            dest="data/tmp/${bt}"
+            dest="data/tmp/${bt}"   # ✅ Matches billtext_structure.py expectations
             mkdir -p "$dest"
             fname="$(basename "${url%%\?*}")"
             outpath="${dest}/${fname}"
@@ -91,7 +92,7 @@ jobs:
             fi
           done < all_urls.txt
 
-      - name: Decompress files
+      - name: Decompress .xml.gz files
         run: |
           set -euo pipefail
           find data -type f -name '*.xml.gz' -print0 | while IFS= read -r -d '' gz; do
@@ -137,7 +138,9 @@ jobs:
         run: |
           set -euo pipefail
           COUNT_JSON=$(find data -type f -name 'data.json' | wc -l || echo 0)
-          echo "Completed billtext run."
+          COUNT_XML=$(find data -type f -name '*.xml' | wc -l || echo 0)
+          echo "✅ Completed billtext run."
+          echo "XML files: ${COUNT_XML}"
           echo "data.json files created: ${COUNT_JSON}"
           echo "Bucket: ${GCS_BUCKET}"
           echo "Prefix: ${GCS_PREFIX}"
