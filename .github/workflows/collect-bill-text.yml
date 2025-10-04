@@ -13,7 +13,6 @@ env:
   GCS_PREFIX: ${{ secrets.GCS_PREFIX || 'congress-billtext-xml' }}
   GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
   CONGRESS: "119"
-  SESSION: "1"
   BILL_TYPES: "hr s hjres sjres hconres sconres hres sres"
 
 jobs:
@@ -27,16 +26,15 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y curl gzip findutils coreutils python3
+          sudo apt-get install -y curl gzip findutils coreutils
 
       - name: Prepare
         run: |
           set -euo pipefail
-          rm -rf data latest_billtext billtext-manifest.json all_urls.txt
+          rm -rf data all_urls.txt
           mkdir -p data
           touch all_urls.txt
-          USER_AGENT="govinfo-bulk-fetcher/1.0 (+https://your.org)"
-          echo "Congress: ${CONGRESS}, Session: ${SESSION}"
+          echo "Congress: ${CONGRESS}"
           echo "Bill types: ${BILL_TYPES}"
 
       - name: Fetch XML indexes and collect XML URLs
@@ -45,17 +43,19 @@ jobs:
           USER_AGENT="govinfo-bulk-fetcher/1.0 (+https://your.org)"
           for BT in $BILL_TYPES; do
             IDX="index_${BT}.xml"
-            IDX_URL="https://www.govinfo.gov/bulkdata/xml/BILLS/${CONGRESS}/${SESSION}/${BT}"
+            IDX_URL="https://www.govinfo.gov/bulkdata/xml/BILLS/${CONGRESS}/${BT}"
             if curl -fsSL -H "Accept: application/xml" -H "User-Agent: ${USER_AGENT}" "$IDX_URL" -o "$IDX"; then
               grep -Eo 'https?://[^"'"'"'<>[:space:]]+' "$IDX" \
                 | grep -Ei '\.xml(\.gz)?$' \
                 | sort -u >> all_urls.txt || true
+            else
+              echo "WARN: failed to fetch index for $BT"
             fi
           done
           sort -u -o all_urls.txt all_urls.txt || true
           echo "Collected $(wc -l < all_urls.txt || echo 0) XML URLs."
 
-      - name: Download XML files (with Accept header)
+      - name: Download XML files
         run: |
           set -euo pipefail
           USER_AGENT="govinfo-bulk-fetcher/1.0 (+https://your.org)"
@@ -89,7 +89,7 @@ jobs:
             fi
           done < all_urls.txt
 
-      - name: Decompress .xml.gz files (produce plain .xml)
+      - name: Decompress .xml.gz files
         run: |
           set -euo pipefail
           find data -type f -name '*.xml.gz' -print0 | while IFS= read -r -d '' gz; do
@@ -98,13 +98,6 @@ jobs:
               rm -f "$gz"
             fi
           done || true
-
-      - name: Build manifests
-        run: |
-          set -euo pipefail
-          PYTHON=$(which python3 || echo python3)
-          echo "Running build_manifests.py via $PYTHON"
-          $PYTHON -u scripts/build_manifests.py
 
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
@@ -122,25 +115,19 @@ jobs:
           set -euo pipefail
           gsutil ls -b "gs://${GCS_BUCKET}" >/dev/null 2>&1 || gsutil mb -p "${GCP_PROJECT}" "gs://${GCS_BUCKET}"
 
-      - name: Upload latest_billtext to GCS
+      - name: Upload bill text to GCS
         run: |
           set -euo pipefail
           PREFIX="${GCS_PREFIX%/}"
           TARGET="${PREFIX:+${PREFIX}/}data"
-          gsutil -m rsync -r latest_billtext "gs://${GCS_BUCKET}/${TARGET}/"
-
-      - name: Upload manifest to GCS
-        run: |
-          set -euo pipefail
-          PREFIX="${GCS_PREFIX%/}"
-          GS_PREFIX="${PREFIX:+${PREFIX}/}manifests"
-          gsutil -m cp -n billtext-manifest.json "gs://${GCS_BUCKET}/${GS_PREFIX}/" || echo "::warning:: manifest upload may have failed"
+          echo "Uploading to gs://${GCS_BUCKET}/${TARGET}/"
+          gsutil -m rsync -r data "gs://${GCS_BUCKET}/${TARGET}/"
 
       - name: Summary
         run: |
           set -euo pipefail
-          COUNT_TEXT=$(find latest_billtext -type f -name data.json 2>/dev/null | wc -l || echo 0)
+          COUNT_XML=$(find data -type f -name '*.xml' | wc -l || echo 0)
           echo "Completed billtext run."
-          echo "latest_billtext JSON count: ${COUNT_TEXT}"
+          echo "XML files: ${COUNT_XML}"
           echo "Bucket: ${GCS_BUCKET}"
           echo "Prefix: ${GCS_PREFIX}"
