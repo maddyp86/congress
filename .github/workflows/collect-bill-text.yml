@@ -10,10 +10,10 @@ permissions:
 
 env:
   GCS_BUCKET: ${{ secrets.GCS_BUCKET || 'congress-legislative-data' }}
-  GCS_PREFIX: ${{ secrets.GCS_PREFIX || 'congress-billtext-xml' }}
+  GCS_PREFIX: ${{ secrets.GCS_PREFIX || 'congress-billtext-data' }}
   GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
   CONGRESS: "119"
-  SESSION: "1" 
+  SESSION: "1"
   BILL_TYPES: "hr s hjres sjres hconres sconres hres sres"
 
 jobs:
@@ -27,34 +27,37 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y curl gzip findutils coreutils
+          sudo apt-get install -y curl gzip findutils coreutils python3
 
       - name: Prepare
         run: |
           set -euo pipefail
           rm -rf data all_urls.txt
-          mkdir -p data
+          mkdir -p data/tmp
           touch all_urls.txt
           echo "Congress: ${CONGRESS}"
           echo "Bill types: ${BILL_TYPES}"
 
-      - name: Fetch XML indexes and collect XML URLs
+      - name: Collect XML URLs
         run: |
           set -euo pipefail
           USER_AGENT="govinfo-bulk-fetcher/1.0 (+https://your.org)"
           for BT in $BILL_TYPES; do
             IDX="index_${BT}.xml"
-            IDX_URL="https://www.govinfo.gov/bulkdata/xml/BILLS/${CONGRESS}/${SESSION}/${BT}"
+            # ✅ Corrected URL: no /SESSION/ in govinfo XML indexes
+            IDX_URL="https://www.govinfo.gov/bulkdata/xml/BILLS/${CONGRESS}/${BT}"
             if curl -fsSL -H "Accept: application/xml" -H "User-Agent: ${USER_AGENT}" "$IDX_URL" -o "$IDX"; then
               grep -Eo 'https?://[^"'"'"'<>[:space:]]+' "$IDX" \
                 | grep -Ei '\.xml(\.gz)?$' \
                 | sort -u >> all_urls.txt || true
+            else
+              echo "WARN: failed to fetch index for $BT"
             fi
           done
           sort -u -o all_urls.txt all_urls.txt || true
           echo "Collected $(wc -l < all_urls.txt || echo 0) XML URLs."
 
-      - name: Download XML files (with Accept header)
+      - name: Download XML files
         run: |
           set -euo pipefail
           USER_AGENT="govinfo-bulk-fetcher/1.0 (+https://your.org)"
@@ -66,7 +69,7 @@ jobs:
                 break
               fi
             done
-            dest="data/${bt}"
+            dest="data/tmp/${bt}"
             mkdir -p "$dest"
             fname="$(basename "${url%%\?*}")"
             outpath="${dest}/${fname}"
@@ -88,7 +91,7 @@ jobs:
             fi
           done < all_urls.txt
 
-      - name: Decompress .xml.gz files
+      - name: Decompress files
         run: |
           set -euo pipefail
           find data -type f -name '*.xml.gz' -print0 | while IFS= read -r -d '' gz; do
@@ -97,13 +100,21 @@ jobs:
               rm -f "$gz"
             fi
           done || true
+          
+      - name: Build billtext structure
+        run: |
+          set -euo pipefail
+          chmod +x scripts/billtext_structure.py || true
+          PYTHON=$(which python3 || echo python3)
+          echo "Running billtext_structure.py via $PYTHON"
+          $PYTHON -u scripts/billtext_structure.py
 
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
-      - name: Setup gcloud
+      - name: Setup Gcloud
         uses: google-github-actions/setup-gcloud@v2
         with:
           project_id: ${{ env.GCP_PROJECT }}
@@ -120,13 +131,13 @@ jobs:
           PREFIX="${GCS_PREFIX%/}"
           TARGET="${PREFIX:+${PREFIX}/}data"
           echo "Uploading to gs://${GCS_BUCKET}/${TARGET}/"
-          gsutil -m rsync -r data "gs://${GCS_BUCKET}/${TARGET}/"
+          gsutil -m rsync -r "data/${CONGRESS}" "gs://${GCS_BUCKET}/${TARGET}/${CONGRESS}/"
 
       - name: Summary
         run: |
           set -euo pipefail
-          COUNT_XML=$(find data -type f -name '*.xml' | wc -l || echo 0)
+          COUNT_JSON=$(find data -type f -name 'data.json' | wc -l || echo 0)
           echo "Completed billtext run."
-          echo "XML files: ${COUNT_XML}"
+          echo "data.json files created: ${COUNT_JSON}"
           echo "Bucket: ${GCS_BUCKET}"
           echo "Prefix: ${GCS_PREFIX}"
