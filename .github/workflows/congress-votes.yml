@@ -1,5 +1,5 @@
 # .github/workflows/collect-votes.yml
-name: Collect Congress Votes (119) — Incremental
+name: Collect Congress Votes (119)
 
 on:
   workflow_dispatch:
