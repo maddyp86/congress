@@ -161,10 +161,11 @@ jobs:
         env:
           GCS_BUCKET: ${{ env.GCS_BUCKET }}
           GCS_PREFIX: ${{ env.GCS_PREFIX }}
+          MANIFEST_MODE: "votes"
         run: |
           set -euo pipefail
           . env/bin/activate
-          python scripts/build_votes_manifest.py
+          python scripts/build_manifests.py
 
       - name: Validate manifest
         run: |
