@@ -1,5 +1,5 @@
 # .github/workflows/collect-votes.yml
-name: Collect Congress Votes (119)
+name: Collect Congress Votes (119) — Incremental
 
 on:
   workflow_dispatch:
@@ -142,8 +142,12 @@ jobs:
             exit 1
           fi
           # Show sample for debugging
+          # Note: pipefail temporarily disabled — head -10 closing the pipe
+          # causes sort to exit with code 2 which would kill the step otherwise
           echo "Sample vote files:"
+          set +o pipefail
           find data -type f -name "data.json" -path "*/votes/*" | sort | head -10 | sed 's/^/  /'
+          set -o pipefail
 
       # ---------------------------------------------------------------
       # 5. BUILD VOTES-ONLY MANIFEST
