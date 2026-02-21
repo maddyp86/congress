@@ -1,4 +1,4 @@
-name: Collect Congress Bills (119) — Incremental
+name: Collect Congress Bills (119)
 
 on:
   workflow_dispatch:
