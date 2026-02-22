@@ -51,25 +51,23 @@ def atomic_write(path: Path, obj):
         raise
 
 
-def local_path_to_gcs_url(filepath: str) -> str:
+def path_to_gcs_url(filepath: str) -> str:
     """
-    Convert a local data.json filepath to its public GCS URL.
+    Convert a manifest file path to its public GCS URL.
 
-    Bills — local path structure (confirmed from GitHub Actions logs):
-      data/119/bills/s/s123/data.json
-      data/119/bills/sres/sres45/data.json
+    Bills — manifest path (bills/ already stripped during classification):
+      data/119/s/s123/data.json
+      data/119/sres/sres45/data.json
 
-    Bills — GCS path structure (rsync strips 'bills/' during upload):
-      congress-bill-data/data/119/s/s123/data.json
-      congress-bill-data/data/119/sres/sres45/data.json
+    Bills — GCS URL:
+      https://storage.googleapis.com/.../congress-bill-data/data/119/s/s123/data.json
 
-    Votes — local path structure:
+    Votes — manifest path:
       data/119/votes/2025/h1/data.json
       data/119/votes/2025/s1/data.json
 
-    Votes — GCS path structure (rsync preserves path as-is):
-      congress-vote-data/data/119/votes/2025/h1/data.json
-      congress-vote-data/data/119/votes/2025/s1/data.json
+    Votes — GCS URL:
+      https://storage.googleapis.com/.../congress-vote-data/data/119/votes/2025/h1/data.json
     """
     if not bucket:
         return ""
@@ -82,10 +80,8 @@ def local_path_to_gcs_url(filepath: str) -> str:
     elif rel.startswith("latest_billtext/"):
         rel = rel[len("latest_billtext/"):]
 
-    # Bills only: strip 'bills/' segment — matches what rsync does during upload
-    # Votes: no stripping needed, path maps directly to GCS
-    if "/bills/" in rel:
-        rel = rel.replace("/bills/", "/", 1)
+    # No bills/ stripping needed — already stripped during classification.
+    # Votes path maps directly to GCS as-is.
 
     rel = rel.lstrip("/")
 
@@ -125,7 +121,12 @@ for p in all_data:
         if "/text-versions/" in p:
             text_candidates.append(p)
         else:
-            bills.append(p)
+            # Strip 'bills/' segment to match GCS path structure.
+            # Local:  data/119/bills/s/s100/data.json
+            # GCS:    data/119/s/s100/data.json  (rsync strips bills/)
+            # Manifest must use GCS-equivalent path so n8n file_path
+            # entries match what's actually in the bucket.
+            bills.append(p.replace("/bills/", "/", 1))
     else:
         print(f"DEBUG: ignoring unexpected data.json location: {p}")
 
@@ -135,7 +136,6 @@ print(f"DEBUG: classified — votes={len(votes)}, bills={len(bills)}, text-versi
 # Validate — rules depend on which action is calling this script
 # -----------------------------------------------------------------------
 if mode == "votes":
-    # Called from collect-votes action — only votes are expected
     if not votes:
         print("ERROR: No vote data.json files found — usc-run votes may have failed.", flush=True)
         sys.exit(2)
@@ -150,7 +150,6 @@ if mode == "votes":
         print("INFO: No bill data.json files found — expected in votes mode.")
 
 else:
-    # Called from collect-bills action (default) — only bills are expected
     if not bills:
         print("ERROR: No bill data.json files found — usc-run bills may have failed.", flush=True)
         sys.exit(2)
@@ -203,7 +202,7 @@ for name, files in manifests.items():
         print(f"ERROR: writing {name}: {e}", flush=True)
         sys.exit(3)
 
-    gcs_urls = [local_path_to_gcs_url(f) for f in files]
+    gcs_urls = [path_to_gcs_url(f) for f in files]
 
     # Spot-check bills GCS URLs for sanity
     if gcs_urls and name == "bills-manifest.json":
