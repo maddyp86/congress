@@ -1,18 +1,26 @@
-# .github/workflows/collect-votes.yml
+# .github/workflows/collect-congress-votes.yml
 name: Collect Congress Votes (119)
+
+# Responsibility: Fetch all votes from Congress.gov, upload to GCS, write manifest.
+# No incremental diff logic — that is handled downstream by n8n using the
+# Vote_Manifest Google Sheet as the system of record.
+#
+# Fast/full mode is preserved — this is a scraper-level optimization,
+# not a diff. --fast only re-fetches recent votes; the weekly full run
+# ensures nothing was missed.
 
 on:
   workflow_dispatch:
     inputs:
-      force_full_sync:
-        description: "Force full re-sync (skip --fast, re-upload everything)"
+      full_sync:
+        description: "Force full re-fetch (ignore --fast)"
         required: false
         default: "false"
         type: choice
         options: ["false", "true"]
   schedule:
-    - cron: "30 9 * * *"  # nightly fast mode (09:30 UTC)
-    - cron: "0 10 * * 0"  # weekly full mode (Sunday 10:00 UTC)
+    - cron: "0 10 * * *"    # nightly fast mode (10:00 UTC, after bills at 09:30)
+    - cron: "0 11 * * 0"    # weekly full mode (Sunday 11:00 UTC)
 
 concurrency:
   group: collect-congress-votes
@@ -73,7 +81,6 @@ jobs:
           set -euo pipefail
           : "${GCP_PROJECT:?Missing required secret GCP_PROJECT}"
           : "${GCS_BUCKET:?Missing required GCS_BUCKET}"
-          # Warn if SESSIONS still uses the default — needs annual update
           if [[ "${SESSIONS}" == *"2026"* ]] && [[ "$(date +%Y)" -gt "2026" ]]; then
             echo "WARNING: SESSIONS env var may be outdated. Current year is $(date +%Y). Update the SESSIONS secret."
           fi
@@ -82,7 +89,7 @@ jobs:
         run: mkdir -p data
 
       # ---------------------------------------------------------------
-      # 2. GCP AUTH — needed early to query GCS before uploading
+      # 2. GCP AUTH
       # ---------------------------------------------------------------
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
@@ -104,58 +111,53 @@ jobs:
       # ---------------------------------------------------------------
       # 3. FETCH VOTES
       #
-      #    FIX: Schedule detection now uses a proper step condition
-      #    instead of comparing ${{ github.event.schedule }} in bash,
-      #    which always resolved to the literal nightly cron string
-      #    causing --fast to run even on the weekly full-sync schedule.
+      #    Nightly: --fast fetches only recent votes (fast, ~10 min)
+      #    Weekly:  full fetch catches anything --fast may have missed
+      #    Manual:  full_sync=true forces a full re-fetch
+      #
+      #    NOTE: Step conditions use YAML-level if: to correctly detect
+      #    which schedule fired. Comparing github.event.schedule in bash
+      #    always resolves to the literal nightly string — a known bug.
       #
       #    Confirmed local path structure from logs:
       #      data/119/votes/2025/h1/data.json   (House)
       #      data/119/votes/2025/s1/data.json   (Senate)
       # ---------------------------------------------------------------
       - name: Fetch Votes (nightly — fast mode)
-        if: github.event.schedule == '30 9 * * *' || github.event_name == 'workflow_dispatch' && github.event.inputs.force_full_sync == 'false'
+        if: github.event.schedule == '0 10 * * *' || (github.event_name == 'workflow_dispatch' && github.event.inputs.full_sync == 'false')
         run: |
           set -euo pipefail
           . env/bin/activate
-          echo "Running in FAST mode (nightly / manual without force)"
+          echo "Running in FAST mode"
           usc-run votes --sessions="${SESSIONS}" --fast --log=info
 
-      - name: Fetch Votes (weekly — full mode)
-        if: github.event.schedule == '0 10 * * 0' || github.event_name == 'workflow_dispatch' && github.event.inputs.force_full_sync == 'true'
+      - name: Fetch Votes (weekly / forced — full mode)
+        if: github.event.schedule == '0 11 * * 0' || (github.event_name == 'workflow_dispatch' && github.event.inputs.full_sync == 'true')
         run: |
           set -euo pipefail
           . env/bin/activate
-          echo "Running in FULL mode (weekly / forced manual)"
+          echo "Running in FULL mode"
           usc-run votes --sessions="${SESSIONS}" --log=info
 
       # ---------------------------------------------------------------
-      # 4. VALIDATE — make sure we got something
+      # 4. VALIDATE
       # ---------------------------------------------------------------
       - name: Validate fetched votes
         run: |
           set -euo pipefail
           COUNT=$(find data -type f -name "data.json" -path "*/votes/*" | wc -l | tr -d ' ')
-          echo "Total vote data.json files fetched: ${COUNT}"
+          echo "Total vote data.json files: ${COUNT}"
           if [ "${COUNT}" -eq 0 ]; then
             echo "ERROR: No vote files produced — usc-run votes may have failed"
             exit 1
           fi
-          # Show sample for debugging
-          # Note: pipefail temporarily disabled — head -10 closing the pipe
-          # causes sort to exit with code 2 which would kill the step otherwise
           echo "Sample vote files:"
           set +o pipefail
           find data -type f -name "data.json" -path "*/votes/*" | sort | head -10 | sed 's/^/  /'
           set -o pipefail
 
       # ---------------------------------------------------------------
-      # 5. BUILD VOTES-ONLY MANIFEST
-      #
-      #    FIX: Uses build_votes_manifest.py instead of the shared
-      #    build_manifests.py. This avoids writing empty bills-manifest
-      #    and billtext-manifest files, and keeps the votes action
-      #    fully self-contained.
+      # 5. BUILD MANIFEST
       # ---------------------------------------------------------------
       - name: Build votes manifest
         env:
@@ -175,161 +177,53 @@ jobs:
             exit 1
           fi
           COUNT=$(jq '.files | length' votes-manifest.json 2>/dev/null || echo 0)
-          echo "Manifest file count: ${COUNT}"
+          echo "Manifest contains ${COUNT} votes"
           if [ "${COUNT}" -eq 0 ]; then
-            echo "ERROR: votes-manifest.json is empty — aborting upload"
+            echo "ERROR: Manifest is empty — aborting upload"
             exit 1
           fi
 
       # ---------------------------------------------------------------
-      # 6. QUERY GCS — what votes do we already have?
+      # 6. UPLOAD TO GCS
       #
+      #    rsync uploads all vote files (both data.json and data.xml).
       #    Confirmed GCS path structure from logs:
       #      congress-vote-data/data/119/votes/2025/h1/data.json
       #      congress-vote-data/data/119/votes/2025/s1/data.json
-      #
-      #    Note: GCS also stores data.xml per vote (confirmed from logs).
-      #    We diff on data.json only as the canonical presence indicator.
+      #    Unlike bills, votes path maps directly — no segment stripping.
       # ---------------------------------------------------------------
-      - name: Get existing votes from GCS
-        id: gcs_state
+      - name: Upload votes to GCS
         run: |
           set -euo pipefail
           PREFIX="${GCS_PREFIX%/}"
-          TARGET_BASE="gs://${GCS_BUCKET}/${PREFIX}/data/${CONGRESSES}/votes"
+          for C in data/*; do
+            [ -d "$C/votes" ] || continue
+            CONS=$(basename "$C")
+            GCS_DEST="gs://${GCS_BUCKET}/${PREFIX}/data/${CONS}/votes"
+            echo "Syncing votes for Congress ${CONS} -> ${GCS_DEST}"
+            gsutil -m rsync -r "$C/votes" "${GCS_DEST}"
+          done
 
-          echo "Querying GCS for existing vote data.json files..."
-          gsutil -m ls -r "${TARGET_BASE}/**" 2>/dev/null \
-            | grep 'data\.json$' \
-            | sed "s|gs://${GCS_BUCKET}/||" \
-            | sort > /tmp/gcs_existing_votes.txt || true
-
-          EXISTING=$(wc -l < /tmp/gcs_existing_votes.txt | tr -d ' ')
-          echo "existing_count=${EXISTING}" >> "$GITHUB_OUTPUT"
-          echo "GCS already has ${EXISTING} vote data.json files"
-
-      # ---------------------------------------------------------------
-      # 7. COMPUTE DIFF — which votes are new?
-      # ---------------------------------------------------------------
-      - name: Compute new votes
-        id: diff
-        run: |
-          set -euo pipefail
-          FORCE="${{ github.event.inputs.force_full_sync || 'false' }}"
-          PREFIX="${GCS_PREFIX%/}"
-
-          # Build expected GCS paths from local files
-          # Local:  data/119/votes/2025/h1/data.json
-          # GCS:    congress-vote-data/data/119/votes/2025/h1/data.json
-          # (no path segment stripping needed — votes path maps directly)
-          find data -type f -name "data.json" -path "*/votes/*" \
-            | sed "s|^data/|${PREFIX}/data/|" \
-            | sort > /tmp/govinfo_expected_votes.txt
-
-          EXPECTED=$(wc -l < /tmp/govinfo_expected_votes.txt | tr -d ' ')
-          echo "Locally available: ${EXPECTED} vote files"
-
-          if [ "$FORCE" = "true" ]; then
-            echo "Force sync — treating all ${EXPECTED} votes as new"
-            cp /tmp/govinfo_expected_votes.txt /tmp/new_votes.txt
-          else
-            comm -23 /tmp/govinfo_expected_votes.txt /tmp/gcs_existing_votes.txt \
-              > /tmp/new_votes.txt
-          fi
-
-          NEW=$(wc -l < /tmp/new_votes.txt | tr -d ' ')
-          echo "new_count=${NEW}" >> "$GITHUB_OUTPUT"
-
-          if [ "$NEW" -eq 0 ]; then
-            echo "has_new_votes=false" >> "$GITHUB_OUTPUT"
-            echo "✓ GCS is already up to date — no new votes to upload."
-          else
-            echo "has_new_votes=true" >> "$GITHUB_OUTPUT"
-            echo "${NEW} new votes to upload. First 10:"
-            head -n 10 /tmp/new_votes.txt
-          fi
-
-      # ---------------------------------------------------------------
-      # 8. UPLOAD NEW VOTES ONLY
-      #
-      #    Uploads both data.json and data.xml for each new vote.
-      #    On weekly full-sync runs, uploads everything (force=true).
-      #    On nightly runs, uploads only the delta.
-      # ---------------------------------------------------------------
-      - name: Upload new votes to GCS
-        if: steps.diff.outputs.has_new_votes == 'true'
-        run: |
-          set -euo pipefail
-          PREFIX="${GCS_PREFIX%/}"
-          UPLOADED=0
-          SKIPPED=0
-
-          while IFS= read -r gcs_json_path; do
-            [ -z "$gcs_json_path" ] && continue
-
-            # Convert GCS path back to local path
-            # GCS:   congress-vote-data/data/119/votes/2025/h1/data.json
-            # Local: data/119/votes/2025/h1/data.json
-            LOCAL_JSON="data/${gcs_json_path#${PREFIX}/data/}"
-            LOCAL_XML="${LOCAL_JSON%.json}.xml"
-            GCS_XML="${gcs_json_path%.json}.xml"
-
-            # Upload data.json
-            if [ -f "$LOCAL_JSON" ]; then
-              gsutil cp "$LOCAL_JSON" "gs://${GCS_BUCKET}/${gcs_json_path}"
-              UPLOADED=$((UPLOADED + 1))
-            else
-              echo "  WARN: missing locally: ${LOCAL_JSON}"
-              SKIPPED=$((SKIPPED + 1))
-            fi
-
-            # Upload data.xml if present (votes include XML alongside JSON)
-            if [ -f "$LOCAL_XML" ]; then
-              gsutil cp "$LOCAL_XML" "gs://${GCS_BUCKET}/${GCS_XML}"
-            fi
-
-          done < /tmp/new_votes.txt
-
-          echo "Uploaded: ${UPLOADED} votes | Skipped: ${SKIPPED}"
-
-      - name: Skip upload (already up to date)
-        if: steps.diff.outputs.has_new_votes == 'false'
-        run: echo "✓ No new votes — skipping upload."
-
-      # ---------------------------------------------------------------
-      # 9. UPLOAD MANIFEST
-      # ---------------------------------------------------------------
       - name: Upload votes manifest to GCS
-        if: steps.diff.outputs.has_new_votes == 'true'
         run: |
           set -euo pipefail
           PREFIX="${GCS_PREFIX%/}"
-          # No || true — a failed manifest upload should fail the job
           gsutil cp votes-manifest.json "gs://${GCS_BUCKET}/${PREFIX}/votes-manifest.json"
           gsutil cp votes-manifest-gcs.json "gs://${GCS_BUCKET}/${PREFIX}/votes-manifest-gcs.json"
           echo "✓ Manifest uploaded"
 
       # ---------------------------------------------------------------
-      # 10. SUMMARY
+      # 7. SUMMARY
       # ---------------------------------------------------------------
       - name: Summary
         if: always()
         run: |
-          EXISTING="${{ steps.gcs_state.outputs.existing_count || 0 }}"
-          NEW="${{ steps.diff.outputs.new_count || 0 }}"
-          HAS_NEW="${{ steps.diff.outputs.has_new_votes || 'false' }}"
           MANIFEST_COUNT=$(jq '.files | length' votes-manifest.json 2>/dev/null || echo 0)
           echo "================================================"
           echo "  Run Summary"
           echo "================================================"
-          echo "  Votes already in GCS  : ${EXISTING}"
-          echo "  New votes uploaded    : ${NEW}"
-          echo "  Manifest total        : ${MANIFEST_COUNT}"
+          echo "  Votes in manifest     : ${MANIFEST_COUNT}"
           echo "  Bucket                : ${GCS_BUCKET}"
           echo "  Prefix                : ${GCS_PREFIX}"
-          if [ "$HAS_NEW" = "false" ]; then
-            echo "  Result: ✓ Already up to date"
-          else
-            echo "  Result: ✓ Uploaded ${NEW} new votes"
-          fi
+          echo "  Result: ✓ Complete"
           echo "================================================"
