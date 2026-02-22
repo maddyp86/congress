@@ -1,16 +1,14 @@
+# .github/workflows/collect-congress-bills.yml
 name: Collect Congress Bills (119)
 
+# Responsibility: Fetch all senate bills from GovInfo, upload to GCS, write manifest.
+# No incremental diff logic — that is handled downstream by n8n using the
+# Bill_Manifest Google Sheet as the system of record.
+
 on:
-  workflow_dispatch:
-    inputs:
-      force_full_sync:
-        description: "Force full re-sync (ignore GCS state)"
-        required: false
-        default: "false"
-        type: choice
-        options: ["false", "true"]
+  workflow_dispatch: {}
   schedule:
-    - cron: "30 9 * * *" # nightly (09:30 UTC)
+    - cron: "30 9 * * *"  # nightly (09:30 UTC)
 
 concurrency:
   group: collect-congress-bills
@@ -72,11 +70,11 @@ jobs:
           : "${GCP_PROJECT:?Missing required secret GCP_PROJECT}"
           : "${GCS_BUCKET:?Missing required GCS_BUCKET}"
 
-      - name: Ensure data dir
+      - name: Ensure Data Dir
         run: mkdir -p data
 
       # ---------------------------------------------------------------
-      # 2. GCP AUTH — needed early to query GCS before downloading
+      # 2. GCP AUTH
       # ---------------------------------------------------------------
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
@@ -96,229 +94,119 @@ jobs:
             || gsutil mb -p "${GCP_PROJECT}" "gs://${GCS_BUCKET}"
 
       # ---------------------------------------------------------------
-      # 3. QUERY GCS — what senate bills do we already have?
+      # 3. FETCH BILLS
       #
-      # Confirmed GCS path structure from logs:
-      #   congress-bill-data/data/119/s/s123/data.json
-      #   congress-bill-data/data/119/sres/sres45/data.json
+      #    usc-run govinfo downloads BILLSTATUS XMLs into cache.
+      #    usc-run bills reads that cache and writes parsed data.json
+      #    files into data/119/bills/<type>/<number>/data.json.
+      #    Both steps must run sequentially — govinfo first.
+      #
+      #    Confirmed local path structure from logs:
+      #      data/119/bills/s/s123/data.json
+      #      data/119/bills/sres/sres45/data.json
       # ---------------------------------------------------------------
-      - name: Get existing Senate bills from GCS
-        id: gcs_state
-        run: |
-          set -euo pipefail
-          PREFIX="${GCS_PREFIX%/}"
-          TARGET_BASE="gs://${GCS_BUCKET}/${PREFIX}/data/${CONGRESSES}"
-
-          echo "Querying GCS for existing senate bill paths..."
-          > /tmp/gcs_existing.txt
-
-          for TYPE in ${SENATE_TYPES}; do
-            gsutil -m ls -r "${TARGET_BASE}/${TYPE}/**" 2>/dev/null \
-              | grep 'data\.json$' \
-              | sed "s|gs://${GCS_BUCKET}/||" \
-              >> /tmp/gcs_existing.txt || true
-          done
-
-          sort -o /tmp/gcs_existing.txt /tmp/gcs_existing.txt
-
-          EXISTING=$(wc -l < /tmp/gcs_existing.txt | tr -d ' ')
-          echo "existing_count=${EXISTING}" >> "$GITHUB_OUTPUT"
-          echo "GCS already has ${EXISTING} senate bill data.json files"
-
-      # ---------------------------------------------------------------
-      # 4. FETCH GOVINFO BILLSTATUS INDEX
-      #    Downloads the index/zip only — fast, typically seconds.
-      #    Does NOT download individual bill XMLs yet.
-      # ---------------------------------------------------------------
-      - name: Fetch GovInfo BILLSTATUS index
+      - name: Fetch GovInfo BILLSTATUS
         run: |
           set -euo pipefail
           . env/bin/activate
+          echo "Downloading BILLSTATUS index from GovInfo..."
           usc-run govinfo --bulkdata=BILLSTATUS --congress="${CONGRESSES}"
 
-      # ---------------------------------------------------------------
-      # 5. COMPUTE DIFF — which senate bills are new?
-      #
-      # Confirmed local path structure from logs:
-      #   data/119/bills/s/s123/data.json
-      #   data/119/bills/sres/sres45/data.json
-      #
-      # The rsync in the original action strips "bills/" when uploading:
-      #   data/119/bills/s/ → gs://.../data/119/s/
-      # ---------------------------------------------------------------
-      - name: Compute new senate bills
-        id: diff
-        run: |
-          set -euo pipefail
-          FORCE="${{ github.event.inputs.force_full_sync || 'false' }}"
-          PREFIX="${GCS_PREFIX%/}"
-
-          > /tmp/govinfo_expected.txt
-
-          for TYPE in ${SENATE_TYPES}; do
-            LOCAL_TYPE_DIR="data/${CONGRESSES}/bills/${TYPE}"
-            if [ ! -d "$LOCAL_TYPE_DIR" ]; then
-              echo "  No local dir for type ${TYPE} — skipping"
-              continue
-            fi
-
-            # Map local paths to their expected GCS equivalents:
-            # Local:  data/119/bills/s/s123/data.json
-            # GCS:    congress-bill-data/data/119/s/s123/data.json
-            find "${LOCAL_TYPE_DIR}" -name "data.json" -type f \
-              | sed "s|data/${CONGRESSES}/bills/|${PREFIX}/data/${CONGRESSES}/|" \
-              >> /tmp/govinfo_expected.txt
-          done
-
-          sort -o /tmp/govinfo_expected.txt /tmp/govinfo_expected.txt
-
-          GOVINFO_COUNT=$(wc -l < /tmp/govinfo_expected.txt | tr -d ' ')
-          echo "GovInfo index has ${GOVINFO_COUNT} senate bills available"
-
-          if [ "$FORCE" = "true" ]; then
-            echo "Force full sync — treating all ${GOVINFO_COUNT} bills as new"
-            cp /tmp/govinfo_expected.txt /tmp/new_bills.txt
-          else
-            # New = expected by GovInfo but NOT yet in GCS
-            comm -23 /tmp/govinfo_expected.txt /tmp/gcs_existing.txt \
-              > /tmp/new_bills.txt
-          fi
-
-          NEW_COUNT=$(wc -l < /tmp/new_bills.txt | tr -d ' ')
-          echo "new_count=${NEW_COUNT}" >> "$GITHUB_OUTPUT"
-
-          if [ "$NEW_COUNT" -eq 0 ]; then
-            echo "has_new_bills=false" >> "$GITHUB_OUTPUT"
-            echo "✓ GCS is already up to date — nothing to process."
-          else
-            echo "has_new_bills=true" >> "$GITHUB_OUTPUT"
-            echo "${NEW_COUNT} new senate bills found. First 20:"
-            head -n 20 /tmp/new_bills.txt
-          fi
-
-      # ---------------------------------------------------------------
-      # 6. PROCESS BILLS
-      #    usc-run bills parses BILLSTATUS XMLs into data.json files.
-      #    No --bills flag exists in this tool (confirmed from logs),
-      #    so we run it fully — but only upload the new ones in step 7.
-      # ---------------------------------------------------------------
-      - name: Process bills
-        if: steps.diff.outputs.has_new_bills == 'true'
+      - name: Process Bills
         run: |
           set -euo pipefail
           . env/bin/activate
-          usc-run bills
+          echo "Processing bills into data/..."
+          usc-run bills --congress="${CONGRESSES}" --log=info
 
-      - name: Validate processed bills
-        if: steps.diff.outputs.has_new_bills == 'true'
+      # ---------------------------------------------------------------
+      # 4. VALIDATE
+      # ---------------------------------------------------------------
+      - name: Validate fetched bills
         run: |
           set -euo pipefail
-          COUNT=$(find data -type f -name "data.json" -path "*/bills/*/data.json" | wc -l | tr -d ' ')
-          echo "Total processed data.json files: ${COUNT}"
-          if [ "$COUNT" -eq 0 ]; then
-            echo "ERROR: No data.json files produced — aborting"
+          COUNT=$(find data -type f -name "data.json" -path "*/bills/*" | wc -l | tr -d ' ')
+          echo "Total bill data.json files: ${COUNT}"
+          if [ "${COUNT}" -eq 0 ]; then
+            echo "ERROR: No bill files produced — usc-run bills may have failed"
             exit 1
           fi
+          echo "Sample bill files:"
+          set +o pipefail
+          find data -type f -name "data.json" -path "*/bills/*" | sort | head -10 | sed 's/^/  /'
+          set -o pipefail
 
       # ---------------------------------------------------------------
-      # 7. UPLOAD NEW BILLS ONLY
-      #    /tmp/new_bills.txt has the exact GCS paths that are missing.
-      #    We convert each back to its local path and upload only that file.
-      #
-      #    GCS path:   congress-bill-data/data/119/s/s123/data.json
-      #    Local path: data/119/bills/s/s123/data.json
-      # ---------------------------------------------------------------
-      - name: Upload new senate bills to GCS
-        if: steps.diff.outputs.has_new_bills == 'true'
-        run: |
-          set -euo pipefail
-          PREFIX="${GCS_PREFIX%/}"
-          UPLOADED=0
-          SKIPPED=0
-
-          while IFS= read -r gcs_path; do
-            [ -z "$gcs_path" ] && continue
-
-            # Convert GCS path → local path
-            # congress-bill-data/data/119/s/s123/data.json
-            #   strip prefix → data/119/s/s123/data.json
-            #   insert bills/ → data/119/bills/s/s123/data.json
-            STRIPPED="${gcs_path#${PREFIX}/}"
-            LOCAL_PATH=$(echo "$STRIPPED" | sed "s|data/${CONGRESSES}/|data/${CONGRESSES}/bills/|")
-
-            if [ ! -f "$LOCAL_PATH" ]; then
-              echo "  WARN: local file not found: ${LOCAL_PATH} (for GCS: ${gcs_path})"
-              SKIPPED=$((SKIPPED + 1))
-              continue
-            fi
-
-            gsutil cp "$LOCAL_PATH" "gs://${GCS_BUCKET}/${gcs_path}"
-            UPLOADED=$((UPLOADED + 1))
-
-          done < /tmp/new_bills.txt
-
-          echo "Uploaded: ${UPLOADED} | Not found locally: ${SKIPPED}"
-          if [ "$SKIPPED" -gt 0 ]; then
-            echo "WARNING: ${SKIPPED} bills were expected but missing locally"
-          fi
-
-      # ---------------------------------------------------------------
-      # 8. BUILD, VALIDATE & UPLOAD MANIFEST
+      # 5. BUILD MANIFEST
       # ---------------------------------------------------------------
       - name: Build manifests
-        if: steps.diff.outputs.has_new_bills == 'true'
+        env:
+          GCS_BUCKET: ${{ env.GCS_BUCKET }}
+          GCS_PREFIX: ${{ env.GCS_PREFIX }}
+          MANIFEST_MODE: "bills"
         run: |
           set -euo pipefail
           . env/bin/activate
           python scripts/build_manifests.py
 
       - name: Validate manifest
-        if: steps.diff.outputs.has_new_bills == 'true'
         run: |
           set -euo pipefail
           if [ ! -f bills-manifest.json ]; then
-            echo "ERROR: bills-manifest.json not created by build_manifests.py"
+            echo "ERROR: bills-manifest.json was not created"
             exit 1
           fi
           COUNT=$(jq '.files | length' bills-manifest.json 2>/dev/null || echo 0)
-          echo "Manifest file count: ${COUNT}"
+          echo "Manifest contains ${COUNT} bills"
           if [ "${COUNT}" -eq 0 ]; then
-            echo "ERROR: Manifest is empty or malformed — aborting upload"
+            echo "ERROR: Manifest is empty — aborting upload"
             exit 1
           fi
 
+      # ---------------------------------------------------------------
+      # 6. UPLOAD TO GCS
+      #
+      #    rsync uploads all senate bill types.
+      #    Note: rsync strips the 'bills/' segment from the path.
+      #    Local:  data/119/bills/s/s123/data.json
+      #    GCS:    congress-bill-data/data/119/s/s123/data.json
+      #    build_manifests.py accounts for this in its URL construction.
+      # ---------------------------------------------------------------
+      - name: Upload bills to GCS
+        run: |
+          set -euo pipefail
+          PREFIX="${GCS_PREFIX%/}"
+          for TYPE in ${SENATE_TYPES}; do
+            LOCAL_DIR="data/${CONGRESSES}/bills/${TYPE}"
+            GCS_DEST="gs://${GCS_BUCKET}/${PREFIX}/data/${CONGRESSES}/${TYPE}"
+            if [ -d "${LOCAL_DIR}" ]; then
+              echo "Syncing ${TYPE} -> ${GCS_DEST}"
+              gsutil -m rsync -r "${LOCAL_DIR}" "${GCS_DEST}"
+            else
+              echo "  No data for type ${TYPE} — skipping"
+            fi
+          done
+
       - name: Upload manifest to GCS
-        if: steps.diff.outputs.has_new_bills == 'true'
         run: |
           set -euo pipefail
           PREFIX="${GCS_PREFIX%/}"
           gsutil cp bills-manifest.json "gs://${GCS_BUCKET}/${PREFIX}/bills-manifest.json"
-          gsutil cp bills-manifest.json "gs://${GCS_BUCKET}/${PREFIX}/bills-manifest-gcs.json"
+          gsutil cp bills-manifest-gcs.json "gs://${GCS_BUCKET}/${PREFIX}/bills-manifest-gcs.json"
           echo "✓ Manifest uploaded"
 
       # ---------------------------------------------------------------
-      # 9. SUMMARY
+      # 7. SUMMARY
       # ---------------------------------------------------------------
       - name: Summary
         if: always()
         run: |
-          EXISTING="${{ steps.gcs_state.outputs.existing_count || 0 }}"
-          NEW="${{ steps.diff.outputs.new_count || 0 }}"
-          HAS_NEW="${{ steps.diff.outputs.has_new_bills || 'false' }}"
+          MANIFEST_COUNT=$(jq '.files | length' bills-manifest.json 2>/dev/null || echo 0)
           echo "================================================"
           echo "  Run Summary"
           echo "================================================"
-          echo "  Senate bills already in GCS : ${EXISTING}"
-          echo "  New bills uploaded           : ${NEW}"
-          echo "  Bucket                       : ${GCS_BUCKET}"
-          echo "  Prefix                       : ${GCS_PREFIX}"
-          if [ -f bills-manifest.json ]; then
-            MANIFEST_COUNT=$(jq '.files | length' bills-manifest.json 2>/dev/null || echo 0)
-            echo "  Manifest total (all types)   : ${MANIFEST_COUNT}"
-          fi
-          if [ "$HAS_NEW" = "false" ]; then
-            echo "  Result: ✓ Already up to date — no uploads needed"
-          else
-            echo "  Result: ✓ Uploaded ${NEW} new senate bills"
-          fi
+          echo "  Bills in manifest     : ${MANIFEST_COUNT}"
+          echo "  Bucket                : ${GCS_BUCKET}"
+          echo "  Prefix                : ${GCS_PREFIX}"
+          echo "  Result: ✓ Complete"
           echo "================================================"
