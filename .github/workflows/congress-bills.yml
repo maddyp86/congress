@@ -4,11 +4,25 @@ name: Collect Congress Bills (119)
 # Responsibility: Fetch all senate bills from GovInfo, upload to GCS, write manifest.
 # No incremental diff logic — that is handled downstream by n8n using the
 # Bill_Manifest Google Sheet as the system of record.
+#
+# Incremental/full mode mirrors the votes action. Bills fetch is two-stage
+# (govinfo downloads BILLSTATUS, bills parses it). Incremental relies on
+# govinfo's default sitemap sync (only changed files); full forces a complete
+# re-fetch + re-parse via --force. The weekly full run catches anything the
+# nightly incremental may have missed.
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      full_sync:
+        description: "Force full re-fetch (ignore incremental cache)"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
   schedule:
-    - cron: "30 9 * * *"  # nightly (09:30 UTC)
+    - cron: "30 9 * * *"     # nightly incremental (09:30 UTC)
+    - cron: "30 10 * * 0"    # weekly full (Sunday 10:30 UTC)
 
 concurrency:
   group: collect-congress-bills
@@ -101,23 +115,40 @@ jobs:
       #    files into data/119/bills/<type>/<number>/data.json.
       #    Both steps must run sequentially — govinfo first.
       #
+      #    Nightly / manual full_sync=false : incremental (govinfo sitemap
+      #      sync only pulls changed files).
+      #    Weekly  / manual full_sync=true  : full (--force re-downloads and
+      #      re-parses everything).
+      #
+      #    NOTE: Step conditions use YAML-level if: to detect which schedule
+      #    fired. Comparing github.event.schedule in bash resolves to the
+      #    literal nightly string — a known bug.
+      #
       #    Confirmed local path structure from logs:
       #      data/119/bills/s/s123/data.json
       #      data/119/bills/sres/sres45/data.json
       # ---------------------------------------------------------------
-      - name: Fetch GovInfo BILLSTATUS
+      - name: Fetch Bills (nightly / manual — incremental)
+        if: github.event.schedule == '30 9 * * *' || (github.event_name == 'workflow_dispatch' && github.event.inputs.full_sync == 'false')
         run: |
           set -euo pipefail
           . env/bin/activate
+          echo "Running in INCREMENTAL mode"
           echo "Downloading BILLSTATUS index from GovInfo..."
           usc-run govinfo --bulkdata=BILLSTATUS --congress="${CONGRESSES}"
+          echo "Processing bills into data/..."
+          usc-run bills --congress="${CONGRESSES}" --log=info
 
-      - name: Process Bills
+      - name: Fetch Bills (weekly / forced — full)
+        if: github.event.schedule == '30 10 * * 0' || (github.event_name == 'workflow_dispatch' && github.event.inputs.full_sync == 'true')
         run: |
           set -euo pipefail
           . env/bin/activate
-          echo "Processing bills into data/..."
-          usc-run bills --congress="${CONGRESSES}" --log=info
+          echo "Running in FULL mode"
+          echo "Downloading BILLSTATUS index from GovInfo (forced)..."
+          usc-run govinfo --bulkdata=BILLSTATUS --congress="${CONGRESSES}" --force
+          echo "Processing bills into data/ (forced)..."
+          usc-run bills --congress="${CONGRESSES}" --force --log=info
 
       # ---------------------------------------------------------------
       # 4. VALIDATE
