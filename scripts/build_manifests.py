@@ -11,9 +11,19 @@
 #                       Controls which validation rules apply and which
 #                       manifests are required. Set to "votes" when called
 #                       from the collect-votes action.
+#
+# NOTE (manifest vs. fetch decoupling):
+#   The manifest must reflect the FULL set of objects already in the GCS
+#   bucket — not just what the current CI run fetched locally. The fetch is
+#   intentionally scoped to the current congress (e.g. 119) for speed, so a
+#   pure local scan would silently drop past congresses (e.g. 118) from the
+#   manifest even though their objects still live in the bucket. To prevent
+#   that, we UNION the local scan with a listing of the bucket. See
+#   list_gcs_data_paths() and the union step after classification.
 
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -91,6 +101,62 @@ def path_to_gcs_url(filepath: str) -> str:
         return f"https://storage.googleapis.com/{bucket}/data/{rel}"
 
 
+def list_gcs_data_paths() -> list:
+    """
+    List data.json objects already present in the GCS bucket, returned as
+    manifest-relative paths (i.e. 'data/...').
+
+    Why: the manifest must reflect everything in the bucket, not just what
+    THIS run fetched locally. The CI fetch is intentionally scoped to the
+    current congress for speed; a pure local scan would silently drop past
+    congresses (e.g. 118) from the manifest even though their objects are
+    still in the bucket. Unioning the local scan with this listing keeps the
+    manifest authoritative over the bucket and makes the drop non-recurring.
+
+    Requires an authenticated gsutil. The workflow authenticates to GCP
+    (google-github-actions/auth + setup-gcloud) before invoking this script,
+    so gsutil is on PATH and credentialed at manifest-build time.
+
+    Fails soft: on any listing error this returns [] and the caller falls
+    back to the local scan (logging a WARNING), so manifest generation never
+    hard-crashes on a transient gsutil hiccup.
+    """
+    if not bucket:
+        return []
+
+    base_url = f"gs://{bucket}/{prefix}/data/" if prefix else f"gs://{bucket}/data/"
+    try:
+        proc = subprocess.run(
+            ["gsutil", "ls", f"{base_url}**/data.json"],
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+    except Exception as e:
+        print(f"WARNING: gsutil listing failed ({e}); using local scan only.", flush=True)
+        return []
+
+    if proc.returncode != 0:
+        print(
+            f"WARNING: gsutil ls returned {proc.returncode}; using local scan only. "
+            f"stderr: {proc.stderr.strip()[:300]}",
+            flush=True,
+        )
+        return []
+
+    strip = f"gs://{bucket}/{prefix}/" if prefix else f"gs://{bucket}/"
+    out = []
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line.endswith("/data.json"):
+            continue
+        rel = line[len(strip):] if line.startswith(strip) else line
+        rel = rel.lstrip("/")
+        if rel.startswith("data/"):
+            out.append(rel)
+    return out
+
+
 # -----------------------------------------------------------------------
 # Scan
 # -----------------------------------------------------------------------
@@ -131,6 +197,33 @@ for p in all_data:
         print(f"DEBUG: ignoring unexpected data.json location: {p}")
 
 print(f"DEBUG: classified — votes={len(votes)}, bills={len(bills)}, text-version candidates={len(text_candidates)}")
+
+# -----------------------------------------------------------------------
+# Union local scan with what's already in GCS
+#
+# The local scan only sees the congress this run fetched. Union it with the
+# bucket so the manifest reflects the FULL set of objects present in GCS
+# (e.g. past congresses we intentionally no longer re-fetch). This is what
+# prevents a scoped fetch (e.g. 119-only) from silently dropping 118 from
+# the manifest. Filters keep each mode to its own object class:
+#   votes  -> paths containing '/votes/'
+#   bills  -> paths NOT containing '/votes/' or '/text-versions/'
+#            (bills GCS paths have 'bills/' already stripped, matching the
+#             local classification above)
+# -----------------------------------------------------------------------
+if mode == "votes":
+    remote = [p for p in list_gcs_data_paths() if "/votes/" in p]
+    _local = len(votes)
+    votes = sorted(set(votes) | set(remote))
+    print(f"DEBUG: votes union — local={_local}, remote(GCS)={len(remote)}, union={len(votes)}")
+else:
+    remote = [
+        p for p in list_gcs_data_paths()
+        if "/votes/" not in p and "/text-versions/" not in p
+    ]
+    _local = len(bills)
+    bills = sorted(set(bills) | set(remote))
+    print(f"DEBUG: bills union — local={_local}, remote(GCS)={len(remote)}, union={len(bills)}")
 
 # -----------------------------------------------------------------------
 # Validate — rules depend on which action is calling this script
