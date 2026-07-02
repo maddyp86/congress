@@ -41,6 +41,7 @@ jobs:
       GCS_PREFIX: ${{ secrets.GCS_PREFIX || 'congress-bill-data' }}
       GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
       SENATE_TYPES: "s sres sjres sconres"
+      HOUSE_VOTE_TYPES: "hr hjres hconres"
 
     steps:
       # ---------------------------------------------------------------
@@ -207,7 +208,7 @@ jobs:
         run: |
           set -euo pipefail
           PREFIX="${GCS_PREFIX%/}"
-          for TYPE in ${SENATE_TYPES}; do
+          for TYPE in ${SENATE_TYPES} ${HOUSE_VOTE_TYPES}; do
             LOCAL_DIR="data/${CONGRESSES}/bills/${TYPE}"
             GCS_DEST="gs://${GCS_BUCKET}/${PREFIX}/data/${CONGRESSES}/${TYPE}"
             if [ -d "${LOCAL_DIR}" ]; then
@@ -217,7 +218,7 @@ jobs:
               echo "  No data for type ${TYPE} — skipping"
             fi
           done
-
+          
       - name: Upload manifest to GCS
         run: |
           set -euo pipefail
