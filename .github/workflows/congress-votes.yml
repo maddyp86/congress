@@ -39,6 +39,8 @@ jobs:
       GCS_BUCKET: ${{ secrets.GCS_BUCKET || 'congress-legislative-data' }}
       GCS_PREFIX: ${{ secrets.GCS_PREFIX || 'congress-vote-data' }}
       GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
+      # senate.gov returns 403 to the scraper's default bot User-Agent from GitHub runners.
+      CONGRESS_USER_AGENT: ${{ secrets.CONGRESS_USER_AGENT || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36' }}
 
     steps:
       # ---------------------------------------------------------------
@@ -74,7 +76,9 @@ jobs:
           python -m venv env
           . env/bin/activate
           python -m pip install --upgrade pip
-          pip install "git+https://github.com/unitedstates/congress.git"
+          # Install THIS fork (patched votes scraper), not upstream unitedstates/congress,
+          # which still depends on the retired clerk.house.gov index pages.
+          pip install .
 
       - name: Verify Required Env
         run: |
@@ -146,9 +150,11 @@ jobs:
         run: |
           set -euo pipefail
           COUNT=$(find data -type f -name "data.json" -path "*/votes/*" | wc -l | tr -d ' ')
-          echo "Total vote data.json files: ${COUNT}"
-          if [ "${COUNT}" -eq 0 ]; then
-            echo "ERROR: No vote files produced — usc-run votes may have failed"
+          HOUSE=$(find data -type f -name "data.json" -path "*/votes/*/h*/*" | wc -l | tr -d ' ')
+          SENATE=$(find data -type f -name "data.json" -path "*/votes/*/s*/*" | wc -l | tr -d ' ')
+          echo "Total vote data.json files: ${COUNT} (House: ${HOUSE}, Senate: ${SENATE})"
+          if [ "${HOUSE}" -eq 0 ] || [ "${SENATE}" -eq 0 ]; then
+            echo "::error::A chamber produced 0 votes (House=${HOUSE}, Senate=${SENATE}) — check the Fetch Votes step log for 403/404s"
             exit 1
           fi
           echo "Sample vote files:"

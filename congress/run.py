@@ -73,6 +73,9 @@ def main():
         task_mod.run(options)
     except Exception as exception:
         utils.admin(exception)
+        # Exit non-zero so CI marks the step that actually failed, instead of
+        # reporting success and failing later with a misleading message.
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
