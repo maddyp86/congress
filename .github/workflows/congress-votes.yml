@@ -9,15 +9,13 @@ name: Collect Congress Votes (119)
 #   - House  runs on GitHub-hosted runners. clerk.house.gov retired its vote
 #            index pages, so the patched scraper discovers votes by walking
 #            /evs/<year>/rollNNN.xml.
-#   - Senate runs on a SELF-HOSTED runner (label: senate-votes). senate.gov
-#            returns 403 to GitHub's cloud IPs regardless of User-Agent.
-#   Each chamber publishes on its own, so one chamber failing (or the
-#   self-hosted runner being offline) never blocks the other. The manifest
-#   builder unions with what's already in GCS, so a single-chamber publish
-#   never drops the other chamber's entries.
-#
-# GCP credentials are only used on GitHub-hosted runners; the self-hosted
-# runner only fetches and hands its files over as a workflow artifact.
+#   - Senate also runs on GitHub-hosted runners, but senate.gov returns 403
+#            to GitHub's cloud IPs regardless of User-Agent, so its fetch goes
+#            through the proxy in the SENATE_PROXY_URL secret. No secret =
+#            Senate job skipped with a warning.
+#   Each chamber publishes on its own, so one chamber failing never blocks
+#   the other. The manifest builder unions with what's already in GCS, so a
+#   single-chamber publish never drops the other chamber's entries.
 
 on:
   workflow_dispatch:
@@ -121,24 +119,45 @@ jobs:
           gcs_prefix: ${{ env.GCS_PREFIX }}
 
   # -------------------------------------------------------------------
-  # SENATE — self-hosted (residential IP; senate.gov blocks cloud IPs)
+  # SENATE — GitHub-hosted, routed through a proxy
   #
-  # If the runner is offline the job waits in the queue (up to 24h) and
-  # runs when the machine comes back; House is unaffected.
+  # senate.gov returns 403 to GitHub's cloud IPs. Senate requests go out
+  # through the proxy in the SENATE_PROXY_URL secret (e.g. a residential
+  # proxy: http://user:pass@host:port). Only the fetch step uses it.
+  # Until that secret exists, the job is skipped with a visible warning
+  # instead of failing every night; House is unaffected either way.
   # -------------------------------------------------------------------
   senate:
-    runs-on: [self-hosted, senate-votes]
+    runs-on: ubuntu-latest
     timeout-minutes: 60
+    outputs:
+      enabled: ${{ steps.proxy.outputs.enabled }}
     steps:
+      - name: Check Senate proxy is configured
+        id: proxy
+        env:
+          SENATE_PROXY_URL: ${{ secrets.SENATE_PROXY_URL }}
+        run: |
+          if [ -n "${SENATE_PROXY_URL}" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning title=Senate votes skipped::senate.gov blocks GitHub-hosted runners. Add a SENATE_PROXY_URL repo secret to fetch Senate votes."
+            echo "### ⚠️ Senate votes skipped — SENATE_PROXY_URL secret not set" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       - uses: actions/checkout@v4
+        if: steps.proxy.outputs.enabled == 'true'
         with:
           fetch-depth: 1
 
       - uses: actions/setup-python@v5
+        if: steps.proxy.outputs.enabled == 'true'
         with:
           python-version: "3.11"
 
       - name: Install congress tool (this fork)
+        if: steps.proxy.outputs.enabled == 'true'
         run: |
           set -euo pipefail
           python -m venv env
@@ -146,7 +165,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install .
 
-      - name: Fetch Senate votes
+      - name: Fetch Senate votes (via proxy)
+        if: steps.proxy.outputs.enabled == 'true'
+        env:
+          HTTPS_PROXY: ${{ secrets.SENATE_PROXY_URL }}
+          HTTP_PROXY: ${{ secrets.SENATE_PROXY_URL }}
         run: |
           set -euo pipefail
           . env/bin/activate
@@ -155,6 +178,7 @@ jobs:
           usc-run votes --chamber=senate --sessions="${SESSIONS}" ${FLAG} --log=info
 
       - name: Validate Senate votes
+        if: steps.proxy.outputs.enabled == 'true'
         run: |
           set -euo pipefail
           COUNT=$(find data -type f -name data.json -path "*/votes/*/s*/*" | wc -l | tr -d ' ')
@@ -166,9 +190,11 @@ jobs:
           fi
 
       - name: Package Senate votes
+        if: steps.proxy.outputs.enabled == 'true'
         run: tar czf votes-senate.tgz data/*/votes
 
       - uses: actions/upload-artifact@v4
+        if: steps.proxy.outputs.enabled == 'true'
         with:
           name: votes-senate
           path: votes-senate.tgz
@@ -176,6 +202,7 @@ jobs:
 
   publish-senate:
     needs: senate
+    if: needs.senate.outputs.enabled == 'true'
     runs-on: ubuntu-latest
     concurrency:
       group: congress-votes-publish
