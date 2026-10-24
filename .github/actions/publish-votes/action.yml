@@ -1,0 +1,82 @@
+name: Publish votes to GCS
+description: >
+  Upload fetched vote files to GCS and rebuild the votes manifest.
+  The manifest builder unions local files with what is already in the bucket,
+  and rsync runs without -d, so publishing one chamber never drops the other.
+
+inputs:
+  gcp_sa_key:
+    description: GCP service account JSON
+    required: true
+  gcp_project:
+    required: true
+  gcs_bucket:
+    required: true
+  gcs_prefix:
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Authenticate to GCP
+      uses: google-github-actions/auth@v2
+      with:
+        credentials_json: ${{ inputs.gcp_sa_key }}
+
+    - name: Setup Gcloud
+      uses: google-github-actions/setup-gcloud@v2
+      with:
+        project_id: ${{ inputs.gcp_project }}
+        version: '>= 472.0.0'
+
+    - name: Ensure bucket exists
+      shell: bash
+      env:
+        GCS_BUCKET: ${{ inputs.gcs_bucket }}
+        GCP_PROJECT: ${{ inputs.gcp_project }}
+      run: |
+        set -euo pipefail
+        gsutil ls -b "gs://${GCS_BUCKET}" >/dev/null 2>&1 \
+          || gsutil mb -p "${GCP_PROJECT}" "gs://${GCS_BUCKET}"
+
+    - name: Upload votes to GCS
+      shell: bash
+      env:
+        GCS_BUCKET: ${{ inputs.gcs_bucket }}
+        GCS_PREFIX: ${{ inputs.gcs_prefix }}
+      run: |
+        set -euo pipefail
+        PREFIX="${GCS_PREFIX%/}"
+        for C in data/*; do
+          [ -d "$C/votes" ] || continue
+          CONS=$(basename "$C")
+          GCS_DEST="gs://${GCS_BUCKET}/${PREFIX}/data/${CONS}/votes"
+          echo "Syncing votes for Congress ${CONS} -> ${GCS_DEST}"
+          gsutil -m rsync -r "$C/votes" "${GCS_DEST}"
+        done
+
+    - name: Build votes manifest
+      shell: bash
+      env:
+        GCS_BUCKET: ${{ inputs.gcs_bucket }}
+        GCS_PREFIX: ${{ inputs.gcs_prefix }}
+        MANIFEST_MODE: votes
+      run: python3 scripts/build_manifests.py
+
+    - name: Validate and upload manifest
+      shell: bash
+      env:
+        GCS_BUCKET: ${{ inputs.gcs_bucket }}
+        GCS_PREFIX: ${{ inputs.gcs_prefix }}
+      run: |
+        set -euo pipefail
+        COUNT=$(jq '.files | length' votes-manifest.json)
+        echo "Manifest contains ${COUNT} votes"
+        if [ "${COUNT}" -eq 0 ]; then
+          echo "::error::Manifest is empty — aborting upload"
+          exit 1
+        fi
+        PREFIX="${GCS_PREFIX%/}"
+        gsutil cp votes-manifest.json     "gs://${GCS_BUCKET}/${PREFIX}/votes-manifest.json"
+        gsutil cp votes-manifest-gcs.json "gs://${GCS_BUCKET}/${PREFIX}/votes-manifest-gcs.json"
+        echo "### Votes manifest: ${COUNT} files" >> "$GITHUB_STEP_SUMMARY"

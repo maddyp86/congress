@@ -44,11 +44,24 @@ def run(options):
 
         # Get the list of votes.
         to_fetch = []
+        index_failures = []
         for congress, session_year in sessions:
             if options.get('chamber', None) in ("house", None):
-                to_fetch += vote_ids_for_house(congress, session_year, options) or []
+                ids = vote_ids_for_house(congress, session_year, options)
+                if ids is None:
+                    index_failures.append("house %s.%s" % (congress, session_year))
+                to_fetch += ids or []
             if options.get('chamber', None) in ("senate", None):
-                to_fetch += vote_ids_for_senate(congress, session_year, options) or []
+                ids = vote_ids_for_senate(congress, session_year, options)
+                if ids is None:
+                    index_failures.append("senate %s.%s" % (congress, session_year))
+                to_fetch += ids or []
+
+        if index_failures:
+            # Never report success when a chamber's vote list couldn't be read.
+            # Previously this path logged errors and exited 0, so the workflow
+            # only failed later with a misleading "0 files" message.
+            raise Exception("Could not read vote lists for: %s" % ", ".join(index_failures))
 
         if not to_fetch:
             if not options.get("fast", False):
@@ -85,8 +98,12 @@ def vote_ids_for_house(congress, session_year, options):
         options)
 
     if not page:
-        logging.error("Couldn't download House vote index page, skipping")
-        return None
+        # The Clerk retired the /evs/<year>/index.asp + ROLL_xxx.asp listing pages
+        # (404 since ~Oct 23, 2026), but the per-vote XML files at
+        # /evs/<year>/rollNNN.xml are still published and numbered contiguously.
+        # Fall back to discovering votes by walking those files.
+        logging.warn("House vote index page unavailable; discovering votes by probing roll XML files")
+        return vote_ids_for_house_by_probe(congress, session_year, options)
 
     # extract matching links
     doc = html.document_fromstring(page)
@@ -121,6 +138,38 @@ def vote_ids_for_house(congress, session_year, options):
             vote_ids.append(vote_id)
 
     return utils.uniq(vote_ids)
+
+
+def vote_ids_for_house_by_probe(congress, session_year, options):
+    # Walk https://clerk.house.gov/evs/<year>/rollNNN.xml from 1 upward until
+    # several consecutive numbers are missing. Each file is saved to the same
+    # cache path vote_info.fetch_vote() uses, so the later fetch reads it from
+    # cache instead of downloading it a second time.
+    max_misses = int(options.get("house_probe_misses", 3))
+    vote_ids = []
+    misses = 0
+    num = 0
+    while misses < max_misses:
+        num += 1
+        url = "https://clerk.house.gov/evs/%s/roll%03d.xml" % (session_year, num)
+        body = utils.download(
+            url,
+            "%s/votes/%s/h%d/h%d.xml" % (congress, session_year, num, num),
+            utils.merge(options, {'binary': True}),
+        )
+        if not body or b"<rollcall-vote" not in body:
+            misses += 1
+            continue
+        misses = 0
+        vote_id = "h%d-%s.%s" % (num, congress, session_year)
+        if should_process(vote_id, options):
+            vote_ids.append(vote_id)
+
+    logging.warn("House %s: found %d roll call votes by probing" % (session_year, num - max_misses))
+    if num - max_misses == 0:
+        logging.error("No House roll call XML found for %s" % session_year)
+        return None
+    return vote_ids
 
 
 def vote_ids_for_senate(congress, session_year, options):
