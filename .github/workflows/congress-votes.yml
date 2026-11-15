@@ -69,6 +69,33 @@ jobs:
           python -m pip install --upgrade pip
           pip install .
 
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup Gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ secrets.GCP_PROJECT }}
+          version: '>= 472.0.0'
+
+      # --fast only re-fetches votes that are missing locally or under three
+      # days old. A fresh runner has none, so every vote was re-fetched and
+      # re-stamped with the run time, and publish rewrote all ~1,400 objects
+      # nightly. Restoring the stored copies first makes fast mode real.
+      - name: Seed existing votes from the bucket
+        run: |
+          set -euo pipefail
+          PREFIX="${GCS_PREFIX%/}"
+          for S in ${SESSIONS//,/ }; do
+            CONS="${S%%.*}"
+            mkdir -p "data/${CONS}/votes"
+            gsutil -m rsync -r "gs://${GCS_BUCKET}/${PREFIX}/data/${CONS}/votes" "data/${CONS}/votes" \
+              || echo "::warning::No stored votes for Congress ${CONS}; fetching from scratch"
+          done
+          echo "Seeded $(find data -type f -name data.json -path '*/votes/*' | wc -l | tr -d ' ') vote files"
+
       - name: Fetch House votes
         run: |
           set -euo pipefail
@@ -164,6 +191,36 @@ jobs:
           . env/bin/activate
           python -m pip install --upgrade pip
           pip install .
+
+      - name: Authenticate to GCP
+        if: steps.proxy.outputs.enabled == 'true'
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup Gcloud
+        if: steps.proxy.outputs.enabled == 'true'
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ secrets.GCP_PROJECT }}
+          version: '>= 472.0.0'
+
+      # --fast only re-fetches votes that are missing locally or under three
+      # days old. A fresh runner has none, so every vote was re-fetched and
+      # re-stamped with the run time, and publish rewrote all ~1,400 objects
+      # nightly. Restoring the stored copies first makes fast mode real.
+      - name: Seed existing votes from the bucket
+        if: steps.proxy.outputs.enabled == 'true'
+        run: |
+          set -euo pipefail
+          PREFIX="${GCS_PREFIX%/}"
+          for S in ${SESSIONS//,/ }; do
+            CONS="${S%%.*}"
+            mkdir -p "data/${CONS}/votes"
+            gsutil -m rsync -r "gs://${GCS_BUCKET}/${PREFIX}/data/${CONS}/votes" "data/${CONS}/votes" \
+              || echo "::warning::No stored votes for Congress ${CONS}; fetching from scratch"
+          done
+          echo "Seeded $(find data -type f -name data.json -path '*/votes/*' | wc -l | tr -d ' ') vote files"
 
       - name: Fetch Senate votes (via proxy)
         if: steps.proxy.outputs.enabled == 'true'
