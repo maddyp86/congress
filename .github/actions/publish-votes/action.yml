@@ -51,8 +51,9 @@ runs:
           [ -d "$C/votes" ] || continue
           CONS=$(basename "$C")
           GCS_DEST="gs://${GCS_BUCKET}/${PREFIX}/data/${CONS}/votes"
+          # -c: compare checksums, not mtimes, so unchanged votes are not rewritten
           echo "Syncing votes for Congress ${CONS} -> ${GCS_DEST}"
-          gsutil -m rsync -r "$C/votes" "${GCS_DEST}"
+          gsutil -m rsync -c -r "$C/votes" "${GCS_DEST}"
         done
 
     - name: Build votes manifest

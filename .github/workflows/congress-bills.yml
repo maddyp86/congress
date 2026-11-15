@@ -199,6 +199,9 @@ jobs:
       # 6. UPLOAD TO GCS
       #
       #    rsync uploads all senate bill types.
+      #    -c compares checksums, not mtimes: a fresh runner gives every file a
+      #    new mtime, so without it all ~91k objects are rewritten nightly
+      #    (Class A ops, the bulk of the Google Cloud bill).
       #    Note: rsync strips the 'bills/' segment from the path.
       #    Local:  data/119/bills/s/s123/data.json
       #    GCS:    congress-bill-data/data/119/s/s123/data.json
@@ -213,7 +216,7 @@ jobs:
             GCS_DEST="gs://${GCS_BUCKET}/${PREFIX}/data/${CONGRESSES}/${TYPE}"
             if [ -d "${LOCAL_DIR}" ]; then
               echo "Syncing ${TYPE} -> ${GCS_DEST}"
-              gsutil -m rsync -r "${LOCAL_DIR}" "${GCS_DEST}"
+              gsutil -m rsync -c -r "${LOCAL_DIR}" "${GCS_DEST}"
             else
               echo "  No data for type ${TYPE} — skipping"
             fi
